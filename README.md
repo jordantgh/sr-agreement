@@ -1,0 +1,1 @@
+This is a Python implementation of R's SuperRanker package (https://github.com/tagteam/SuperRanker), based on Ekstrøm et al (2019) "Sequential rank agreement methods for comparison of ranked lists".
