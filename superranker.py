@@ -13,13 +13,14 @@ import numpy as np
 from scipy.stats import genpareto
 
 
-def require_fitted(method):
-    """Decorator that checks if an estimator is fitted before calling a method."""
+def require_generated(method):
+    """Decorator that checks if an estimator was generated before calling a method."""
+
     @functools.wraps(method)
     def wrapped(self, *args, **kwargs):
         if not hasattr(self, "fitted_") or not self.fitted_:
             raise ValueError(
-                f"This {self.__class__.__name__} instance is not fitted yet. Call 'fit' first."
+                f"This {self.__class__.__name__} instance was not generated yet. Call 'generate' first."
             )
         return method(self, *args, **kwargs)
 
@@ -966,22 +967,22 @@ class SRA(BaseEstimator):
         self.fitted_ = True
         return self
 
-    @require_fitted
+    @require_generated
     def get_result(self) -> SRAResult:
         """Get the SRA computation result."""
         return self.result_
 
-    @require_fitted
+    @require_generated
     def values(self) -> np.ndarray:
         """Get the SRA values."""
         return self.result_.values
 
-    @require_fitted
+    @require_generated
     def when_included(self) -> np.ndarray:
         """Get the depth at which each item was first included."""
         return self.result_.when_included
 
-    @require_fitted
+    @require_generated
     def smooth(self, window_size: int = 10) -> np.ndarray:
         """
         Smooth the SRA curve using a rolling window average.
@@ -1053,17 +1054,17 @@ class RandomListSRA(BaseEstimator):
         self.fitted_ = True
         return self
 
-    @require_fitted
+    @require_generated
     def get_result(self) -> RandomListSRAResult:
         """Get the null distribution generation result."""
         return self.result_
 
-    @require_fitted
+    @require_generated
     def distribution(self) -> np.ndarray:
         """Get the null distribution matrix."""
         return self.result_.distribution
 
-    @require_fitted
+    @require_generated
     def confidence_band(
         self, confidence: float = 0.95
     ) -> dict[str, np.ndarray]:
@@ -1082,7 +1083,7 @@ class RandomListSRA(BaseEstimator):
         """
         return self.result_.confidence_band(confidence)
 
-    @require_fitted
+    @require_generated
     def quantiles(self, probs: list[float]) -> dict[float, np.ndarray]:
         """
         Compute quantiles of the null distribution for each depth.
@@ -1181,12 +1182,12 @@ class SRATest(BaseEstimator):
         self.fitted_ = True
         return self
 
-    @require_fitted
+    @require_generated
     def get_result(self) -> TestResult:
         """Get the test result."""
         return self.result_
 
-    @require_fitted
+    @require_generated
     def p_value(self) -> float:
         """Get the p-value (GPD-based if available, otherwise empirical)."""
         return self.result_.p_value
@@ -1273,12 +1274,12 @@ class SRACompare(BaseEstimator):
         self.fitted_ = True
         return self
 
-    @require_fitted
+    @require_generated
     def get_result(self) -> ComparisonResult:
         """Get the comparison result."""
         return self.result_
 
-    @require_fitted
+    @require_generated
     def p_value(self) -> float:
         """Get the p-value for the comparison."""
         return self.result_.p_value
