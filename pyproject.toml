@@ -1,7 +1,7 @@
 [project]
 name = "sr-agreement"
 version = "0.0.1"
-description = "This is a python implementation of https://github.com/tagteam/SuperRanker, based on Ekstrøm et al (2019) "Sequential rank agreement methods for comparison of ranked lists"."
+description = "This is a python implementation of https://github.com/tagteam/SuperRanker, based on Ekstrøm et al (2019) 'Sequential rank agreement methods for comparison of ranked lists'."
 authors = [{ name = "Jordan Taylor", email = "jtaylor81284@gmail.com" }]
 readme = "README.md"
 keywords = ['python']
