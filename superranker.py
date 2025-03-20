@@ -1,182 +1,395 @@
+"""
+SuperRanker: A package for computing and analyzing Sequential Rank Agreement.
+
+This package provides tools for comparing ranked lists, generating null distributions,
+and testing the significance of rank agreement.
+"""
+
+import functools
+import warnings
+from dataclasses import dataclass
+from typing import Literal, Optional, Any
 import numpy as np
-from scipy.stats import norm, t, genpareto
+from scipy.stats import genpareto
+
+
+def require_fitted(method):
+    """Decorator that checks if an estimator is fitted before calling a method."""
+    @functools.wraps(method)
+    def wrapped(self, *args, **kwargs):
+        if not hasattr(self, "fitted_") or not self.fitted_:
+            raise ValueError(
+                f"This {self.__class__.__name__} instance is not fitted yet. Call 'fit' first."
+            )
+        return method(self, *args, **kwargs)
+
+    return wrapped
+
+
+###################
+# Core Data Models
+###################
+
+
+@dataclass(frozen=True)
+class SRAConfig:
+    """Immutable configuration for SRA computation.
+
+    Parameters
+    ----------
+    epsilon : float or array-like, default=0.0
+        Threshold for an item to be included in S(d).
+        Must be between 0 and 1.
+    metric : str, default="sd"
+        Method to measure dispersion of ranks.
+        Must be one of ["sd", "mad"].
+    B : int, default=1
+        Number of bootstrap samples for handling missing values.
+        Must be positive.
+    """
+
+    epsilon: float | np.ndarray = 0.0
+    metric: Literal["sd", "mad"] = "sd"
+    B: int = 1
+
+    def __post_init__(self):
+        # Validate metric
+        if self.metric not in ["sd", "mad"]:
+            raise ValueError(f"Metric must be 'sd' or 'mad', got {self.metric}")
+
+        # Validate B
+        if not isinstance(self.B, int) or self.B < 1:
+            raise ValueError(f"B must be a positive integer, got {self.B}")
+
+        # Validate epsilon
+        if isinstance(self.epsilon, (int, float)):
+            if not 0 <= self.epsilon <= 1:
+                raise ValueError(
+                    f"Epsilon must be between 0 and 1, got {self.epsilon}"
+                )
+        elif isinstance(self.epsilon, np.ndarray):
+            if np.any((self.epsilon < 0) | (self.epsilon > 1)):
+                raise ValueError(
+                    "All values in epsilon array must be between 0 and 1"
+                )
+        else:
+            raise TypeError(
+                f"Epsilon must be float or numpy.ndarray, got {type(self.epsilon)}"
+            )
+
+
+@dataclass(frozen=True)
+class TestConfig:
+    """Configuration for statistical testing of SRA values.
+
+    Parameters
+    ----------
+    style : str, default="l2"
+        Method to aggregate differences.
+        Must be one of ["l2", "max"].
+    window : int, default=1
+        Size of smoothing window. Use 1 for no smoothing.
+        Must be positive.
+    use_gpd : bool, default=False
+        Whether to use generalized Pareto distribution for extreme p-values.
+    threshold_quantile : float, default=0.90
+        Quantile to use as threshold for GPD fitting.
+        Must be between 0 and 1.
+    """
+
+    style: Literal["l2", "max"] = "max"
+    window: int = 1
+    use_gpd: bool = False
+    threshold_quantile: float = 0.90
+
+    def __post_init__(self):
+        # Validate style
+        if self.style not in ["l2", "max"]:
+            raise ValueError(f"Style must be 'l2' or 'max', got {self.style}")
+
+        # Validate window
+        if not isinstance(self.window, int) or self.window < 1:
+            raise ValueError(
+                f"Window size must be a positive integer, got {self.window}"
+            )
+
+        # Validate threshold_quantile
+        if not 0 < self.threshold_quantile < 1:
+            raise ValueError(
+                f"Threshold quantile must be between 0 and 1, got {self.threshold_quantile}"
+            )
+
+
+###################
+# Result Containers
+###################
+
+
+@dataclass(frozen=True)
+class SRAResult:
+    """Immutable container for SRA computation results.
+
+    Attributes
+    ----------
+    values : numpy.ndarray
+        SRA values for each depth.
+    config : SRAConfig
+        Configuration used for computation.
+    when_included : numpy.ndarray, optional
+        Depth at which each item was first included.
+    """
+
+    values: np.ndarray
+    config: SRAConfig
+    when_included: Optional[np.ndarray] = None
+
+    def __post_init__(self):
+        if not isinstance(self.values, np.ndarray):
+            object.__setattr__(self, "values", np.asarray(self.values))
+
+        if self.when_included is not None and not isinstance(
+            self.when_included, np.ndarray
+        ):
+            object.__setattr__(
+                self, "when_included", np.asarray(self.when_included)
+            )
+
+    def smooth(self, window_size: int = 10) -> np.ndarray:
+        """Return smoothed SRA values.
+
+        Parameters
+        ----------
+        window_size : int, default=10
+            Size of the rolling window.
+
+        Returns
+        -------
+        smoothed_values : numpy.ndarray
+            Smoothed SRA curve.
+        """
+        return smooth_sra_window(self.values, window_size)
+
+
+@dataclass(frozen=True)
+class RandomListSRAResult:
+    """Immutable container for null distribution generation results.
+
+    Attributes
+    ----------
+    distribution : numpy.ndarray
+        Matrix of shape (n_depths, n_permutations) containing SRA values
+        for each permutation.
+    config : SRAConfig
+        Configuration used for computation.
+    n_permutations : int
+        Number of permutations used.
+    """
+
+    distribution: np.ndarray
+    config: SRAConfig
+    n_permutations: int
+
+    def __post_init__(self):
+        if not isinstance(self.distribution, np.ndarray):
+            object.__setattr__(
+                self, "distribution", np.asarray(self.distribution)
+            )
+
+    def confidence_band(
+        self, confidence: float = 0.95
+    ) -> dict[str, np.ndarray]:
+        """Compute confidence band for the null distribution.
+
+        Parameters
+        ----------
+        confidence : float, default=0.95
+            Confidence level.
+
+        Returns
+        -------
+        band : dict
+            Dictionary with 'lower' and 'upper' arrays.
+        """
+        alpha = (1 - confidence) / 2
+        lower = np.quantile(self.distribution, alpha, axis=1)
+        upper = np.quantile(self.distribution, 1 - alpha, axis=1)
+        return {"lower": lower, "upper": upper}
+
+
+@dataclass(frozen=True)
+class GPDFit:
+    """Generalized Pareto Distribution fit results.
+
+    Attributes
+    ----------
+    xi : float
+        Shape parameter.
+    beta : float
+        Scale parameter.
+    threshold : float
+        Threshold value.
+    """
+
+    xi: float
+    beta: float
+    threshold: float
+
+
+@dataclass(frozen=True)
+class TestResult:
+    """Immutable container for test results.
+
+    Attributes
+    ----------
+    p_value_empirical : float
+        Empirical p-value.
+    test_statistic : float
+        Test statistic value.
+    null_statistics : numpy.ndarray
+        Null distribution of test statistics.
+    config : TestConfig
+        Test configuration.
+    p_value_gpd : float, optional
+        GPD-adjusted p-value.
+    gpd_fit : GPDFit, optional
+        GPD fit parameters.
+    """
+
+    p_value_empirical: float
+    test_statistic: float
+    null_statistics: np.ndarray
+    config: TestConfig
+    p_value_gpd: Optional[float] = None
+    gpd_fit: Optional[GPDFit] = None
+
+    def __post_init__(self):
+        if not isinstance(self.null_statistics, np.ndarray):
+            object.__setattr__(
+                self, "null_statistics", np.asarray(self.null_statistics)
+            )
+
+    @property
+    def p_value(self) -> float:
+        """Get the best available p-value (GPD if available, otherwise empirical)."""
+        if self.p_value_gpd is not None:
+            return self.p_value_gpd
+        return self.p_value_empirical
+
+
+@dataclass(frozen=True)
+class ComparisonResult:
+    """Immutable container for SRA comparison results.
+
+    Attributes
+    ----------
+    p_value : float
+        P-value for the comparison.
+    test_statistic : float
+        Test statistic value.
+    null_statistics : numpy.ndarray
+        Null distribution of test statistics.
+    config : TestConfig
+        Test configuration.
+    """
+
+    p_value: float
+    test_statistic: float
+    null_statistics: np.ndarray
+    config: TestConfig
+
+    def __post_init__(self):
+        if not isinstance(self.null_statistics, np.ndarray):
+            object.__setattr__(
+                self, "null_statistics", np.asarray(self.null_statistics)
+            )
+
+
+###################
+# Base Estimator
+###################
+
+
+class BaseEstimator:
+    """Base class for all estimators."""
+
+    def __init__(self):
+        self.fitted_ = False
+
+    def generate(self, X: np.ndarray, **kwargs) -> "BaseEstimator":
+        """Fit the estimator to the data."""
+        raise NotImplementedError("Subclasses must implement fit method")
+
+    def _validate_input(self, X: np.ndarray) -> np.ndarray:
+        """Validate input data."""
+        X = np.asarray(X)
+        if X.ndim != 2:
+            raise ValueError(
+                "Input must be a 2D array with shape (n_lists, list_length)"
+            )
+        return X
+
+
+###################
+# Utility Functions
+###################
+
 
 def _reshape_rank_matrix(ranked_lists_array: np.ndarray) -> np.ndarray:
     """
-    Create a rank matrix from the input ranked lists.
+    Create a reshaped rank matrix from the input ranked lists.
 
-    Each row corresponds to a list and each column to an item (ID from 1 to nitems).
-    The output matrix has element [i, j] equal to the rank of item (j+1) in list i.
+    Parameters
+    ----------
+    ranked_lists_array : numpy.ndarray
+        Array of shape (num_lists, nitems) where each row is a ranked list.
 
-    Args:
-        ranked_lists_array: ndarray of shape (num_lists, nitems)
-            Each row must be a permutation of the integers 1 to nitems.
-
-    Returns:
-        rank_matrix: ndarray of shape (num_lists, nitems) where rank_matrix[i, j]
-            is the rank (1-indexed) of item (j+1) in list i.
+    Returns
+    -------
+    rank_matrix : numpy.ndarray
+        Array of shape (num_lists, nitems) where rank_matrix[i, j]
+        is the rank (1-indexed) of item (j+1) in list i.
     """
     num_lists, nitems = ranked_lists_array.shape
     rank_matrix = np.zeros((num_lists, nitems), dtype=int)
-    # For each list, the element in position j is the item ID.
-    # We then set rank_matrix[i, itemID - 1] = (j+1), i.e. the rank.
     rows = np.arange(num_lists)[:, np.newaxis]
-    cols = ranked_lists_array.astype(int) - 1  # convert to 0-indexed
-    # Each row gets assigned the ranks 1,2,...,nitems
+    cols = ranked_lists_array.astype(int) - 1
     rank_matrix[rows, cols] = np.tile(np.arange(1, nitems + 1), (num_lists, 1))
     return rank_matrix
 
 
-def sra(
-    ranked_lists_array: np.ndarray,
-    epsilon: float | np.ndarray = 0.0,
-    B: int = 1,
-    nitems: int | None = None,
-    metric: str = "sd",
-) -> np.ndarray:
-    """
-    Compute the Sequential Rank Agreement (SRA) curve.
-
-    This function handles incomplete/censored lists by imputing missing items
-    via random resampling (B resamples). It supports two agreement metrics:
-    'sd' (variance-based, with a square root transformation applied for interpretability)
-    and 'mad' (median absolute deviation scaled by 1.4826).
-
-    Args:
-        ranked_lists_array: ndarray of shape (num_lists, k)
-            Each row is a ranked list (item IDs from 1 to nitems).
-            Lists can be incomplete (k < nitems) or contain missing values (np.nan).
-        epsilon: Scalar or array-like of length nitems.
-            Threshold for an item to be considered “included” in S(d).
-        B: int, default 1.
-            Number of resamples to perform when imputing missing items.
-        nitems: int or None.
-            The total number of items. If not provided, it is assumed to equal k (the number of columns).
-        metric: str, either "sd" or "mad".
-            Specifies the dispersion measure. "sd" uses variance (with square root later),
-            "mad" uses median absolute deviation (scaled by 1.4826).
-
-    Returns:
-        sra_values: ndarray of shape (nitems,)
-            The SRA curve, where the dth entry is the sequential rank agreement for depth d.
-    """
-    ranked_lists_array = np.array(ranked_lists_array, dtype=float)
-    num_lists, k = ranked_lists_array.shape
-
-    # If nitems is provided and k < nitems, pad each list with missing values (np.nan)
-    if nitems is None:
-        nitems = k
-    elif k < nitems:
-        pad_width = nitems - k
-        pad = np.full((num_lists, pad_width), np.nan)
-        ranked_lists_array = np.concatenate([ranked_lists_array, pad], axis=1)
-
-    # Convert epsilon to an array of length nitems
-    if np.isscalar(epsilon):
-        epsilons = np.full(nitems, float(epsilon))
-    else:
-        epsilons = np.asarray(epsilon, dtype=float)
-        if epsilons.shape[0] != nitems:
-            raise ValueError("Length of epsilon must match nitems.")
-
-    # Prepare to store SRA curves from each resample
-    sra_curves = np.zeros((B, nitems))
-
-    # For each resample, impute missing values and compute the SRA curve
-    for b in range(B):
-        # Impute missing values for each list separately.
-        # Each list is treated as a (possibly partial) permutation.
-        imputed = np.empty_like(ranked_lists_array)
-        for i in range(num_lists):
-            list_i = ranked_lists_array[i, :]
-            # Identify observed (non-missing) entries
-            observed_mask = ~np.isnan(list_i)
-            observed = list_i[observed_mask].astype(int)
-            # Determine positions that are missing
-            missing_idx = np.where(~observed_mask)[0]
-            # The full set of items is assumed to be 1...nitems
-            all_items = set(range(1, nitems + 1))
-            observed_set = set(observed)
-            missing_items = np.array(list(all_items - observed_set), dtype=int)
-            # Randomly shuffle the missing items
-            if missing_items.size > 0:
-                np.random.shuffle(missing_items)
-            # Create the imputed list: keep observed values in place, fill missing positions with shuffled missing items
-            new_list = list_i.copy()
-            for j, idx in enumerate(missing_idx):
-                new_list[idx] = missing_items[j]
-            # In case the list is complete, new_list remains unchanged
-            imputed[i, :] = new_list
-
-        # At this point each row of imputed is a complete permutation of 1...nitems.
-        rank_mat = _reshape_rank_matrix(imputed)  # shape: (num_lists, nitems)
-
-        # Compute dispersion for each item (i.e. for each column) using the chosen metric.
-        if metric.lower() == "sd":
-            # Use variance with ddof=1.
-            disagreements = np.var(rank_mat, axis=0, ddof=1)
-        elif metric.lower() == "mad":
-            # Compute MAD: median(|x - median(x)|) * 1.4826 for each column.
-            def mad(x):
-                med = np.median(x)
-                return np.median(np.abs(x - med)) * 1.4826
-
-            disagreements = np.array(
-                [mad(rank_mat[:, j]) for j in range(nitems)]
-            )
-        else:
-            raise ValueError("Unsupported metric. Choose 'sd' or 'mad'.")
-
-        # For each depth d, define S(d) as the set of items where the proportion of lists
-        # ranking the item in the top d exceeds the threshold epsilon.
-        sra_curve = np.zeros(nitems)
-        for d in range(1, nitems + 1):
-            # Compute, for each item, the proportion of lists with rank <= d.
-            prop = np.mean(rank_mat <= d, axis=0)
-            # Determine the "included" items based on epsilon for depth d.
-            depth_set = prop > epsilons[d - 1]
-            if np.any(depth_set):
-                sra_curve[d - 1] = np.mean(disagreements[depth_set])
-            else:
-                sra_curve[d - 1] = 0.0
-        sra_curves[b, :] = sra_curve
-
-    # Average the SRA curves across resamples.
-    avg_sra = np.mean(sra_curves, axis=0)
-
-    # For the variance-based metric ("sd"), return the square root transformation.
-    if metric.lower() == "sd":
-        avg_sra = np.sqrt(avg_sra)
-
-    return avg_sra
-
-
-def _smooth_sra_window(
+def smooth_sra_window(
     sra_values: np.ndarray, window_size: int = 10
 ) -> np.ndarray:
     """
     Smooth the SRA curve using a rolling window average.
 
-    If window_size > len(sra_values), returns an array filled with the overall mean.
+    Parameters
+    ----------
+    sra_values : numpy.ndarray
+        1D array of SRA values.
+    window_size : int, default=10
+        Window size for rolling mean.
 
-    Args:
-        sra_values: 1D array of SRA values.
-        window_size: Window size for rolling mean.
-
-    Returns:
+    Returns
+    -------
+    smoothed_values : numpy.ndarray
         1D array of smoothed SRA values.
     """
     n = len(sra_values)
     half_w = (window_size - 1) // 2
+
     if window_size > n:
         return np.full(n, np.mean(sra_values))
+
     cs = np.concatenate(([0], np.cumsum(sra_values)))
     smoothed = np.empty(n)
+
     for i in range(n):
         start_idx = max(0, i - half_w)
         end_idx = min(n - 1, i + half_w)
         count = end_idx - start_idx + 1
         smoothed[i] = (cs[end_idx + 1] - cs[start_idx]) / count
+
     return smoothed
 
 
@@ -184,11 +397,16 @@ def _aggregator(diffs: np.ndarray, style: str = "l2") -> float:
     """
     Aggregate a vector of differences.
 
-    Args:
-        diffs: 1D array of differences.
-        style: Aggregation style; "max" returns the maximum, otherwise the sum of squares.
+    Parameters
+    ----------
+    diffs : numpy.ndarray
+        1D array of differences.
+    style : str, default="l2"
+        Aggregation style; "max" returns the maximum, "l2" returns the sum of squares.
 
-    Returns:
+    Returns
+    -------
+    aggregated_value : float
         Aggregated value.
     """
     if style == "max":
@@ -197,517 +415,1257 @@ def _aggregator(diffs: np.ndarray, style: str = "l2") -> float:
         return np.sum(diffs**2)
 
 
-def _loo_var(
-    nullobj: np.ndarray, i: int, sumall: np.ndarray, sumsqs: np.ndarray, B: int
+def _calculate_gpd_pvalue(
+    T_obs: float, T_null: np.ndarray, threshold_quantile: float = 0.90
+) -> dict[str, Any]:
+    """
+    Calculate p-value using Generalized Pareto Distribution (GPD) for extreme values.
+
+    Parameters
+    ----------
+    T_obs : float
+        The observed test statistic
+    T_null : numpy.ndarray
+        Array of null test statistics
+    threshold_quantile : float, default=0.90
+        Quantile of T_null to use as threshold for GPD fitting
+
+    Returns
+    -------
+    result : dict
+        Dictionary containing:
+        - p_value_gpd: GPD-adjusted p-value
+        - gpd_fit: Dictionary with GPD parameters (xi, beta, threshold)
+        - applied_gpd: Boolean indicating if GPD was applied
+    """
+    threshold = np.quantile(T_null, threshold_quantile)
+
+    # If observed statistic isn't extreme, don't apply GPD
+    if T_obs <= threshold:
+        return {
+            "p_value_gpd": np.mean(T_null >= T_obs),
+            "gpd_fit": None,
+            "applied_gpd": False,
+        }
+
+    tail_data = T_null[T_null > threshold]
+
+    # Check if we have enough tail points for stable fitting
+    if tail_data.size < 30:
+        return {
+            "p_value_gpd": np.mean(T_null >= T_obs),
+            "gpd_fit": None,
+            "applied_gpd": False,
+        }
+
+    # Fit GPD to excesses
+    excesses = tail_data - threshold
+    try:
+        xi, _, beta = genpareto.fit(excesses, floc=0)
+        excess_obs = T_obs - threshold
+        tail_prob = genpareto.sf(excess_obs, c=xi, loc=0, scale=beta)
+
+        F_threshold = np.mean(T_null < threshold)
+        p_value_gpd = (1 - F_threshold) * tail_prob
+
+        return {
+            "p_value_gpd": p_value_gpd,
+            "gpd_fit": GPDFit(xi=xi, beta=beta, threshold=threshold),
+            "applied_gpd": True,
+        }
+    except (RuntimeError, ValueError) as e:
+        warnings.warn(
+            f"GPD fitting failed: {str(e)}. Using empirical p-value instead."
+        )
+        return {
+            "p_value_gpd": np.mean(T_null >= T_obs),
+            "gpd_fit": None,
+            "applied_gpd": False,
+        }
+
+
+def _generate_null_distribution(
+    null_matrix: np.ndarray,
+    aggregator_style: str,
 ) -> np.ndarray:
     """
-    Compute the leave-one-out variance for permutation i.
+    Generate null distribution of test statistics.
 
-    Args:
-        nullobj: 2D array (D, B) of null SRA curves (each column is a permutation).
-        i: Column index for leave-one-out.
-        sumall: 1D array of row sums of nullobj.
-        sumsqs: 1D array of row sums of squares of nullobj.
-        B: Total number of permutations.
+    Parameters
+    ----------
+    null_matrix : numpy.ndarray
+        Matrix of shape (n_depths, n_permutations) containing null SRA values.
+    aggregator_style : str
+        Aggregation style; "max" or "l2".
 
-    Returns:
-        1D array of leave-one-out variances.
+    Returns
+    -------
+    T_null : numpy.ndarray
+        Array of test statistics from null distribution.
     """
-    return (
-        (sumsqs - nullobj[:, i] ** 2)
-        - ((sumall - nullobj[:, i]) ** 2) / (B - 1)
-    ) / (B - 2)
-
-
-def test_sra(
-    observed_sra: np.ndarray,
-    null_sra: np.ndarray,
-    window_size: int = 1,
-    style: str = "l2",
-    standardise: bool = False,
-    recompute_sd_for_loo: bool = True,
-) -> dict:
-    """
-    Extended SRA test with optional smoothing and standardisation.
-
-    Args:
-        observed_sra: 1D array of observed SRA values.
-        null_sra: 2D array (D, B) of null SRA curves (each column is one permutation run).
-        window_size: Window size for smoothing (default 1 means no smoothing).
-        style: Aggregation style ("l2" or "max").
-        standardise: Whether to standardise differences by their standard deviation.
-        recompute_sd_for_loo: If standardising, whether to recompute sd in the leave-one-out step.
-
-    Returns:
-        Dictionary with keys:
-          - p_value: Permutation-based p-value.
-          - T_obs: Aggregated statistic for the observed SRA.
-          - T_null: Array of aggregated statistics from null permutations.
-          - style, window_size, standardise.
-    """
-    if window_size > 1:
-        obs_smoothed = _smooth_sra_window(observed_sra, window_size)
-        D, B = null_sra.shape
-        null_smoothed = np.empty_like(null_sra)
-        for b in range(B):
-            null_smoothed[:, b] = _smooth_sra_window(
-                null_sra[:, b], window_size
-            )
-    else:
-        obs_smoothed = observed_sra
-        null_smoothed = null_sra
-
-    D, B = null_smoothed.shape
-
-    if standardise:
-        global_sd = np.std(null_smoothed, axis=1, ddof=1)
-        eps = np.finfo(float).eps
-        mask = global_sd < eps
-        if np.any(mask):
-            non_zero_mean = np.mean(global_sd[~mask]) if np.any(~mask) else 1e-6
-            if non_zero_mean < eps:
-                non_zero_mean = 1e-6
-            global_sd[mask] = non_zero_mean
-
-    ref_all = np.mean(null_smoothed, axis=1)
-    raw_diffs_obs = np.abs(obs_smoothed - ref_all)
-    diffs_obs = raw_diffs_obs / global_sd if standardise else raw_diffs_obs
-    T_obs = _aggregator(diffs_obs, style=style)
-
+    B = null_matrix.shape[1]
+    colsums = np.sum(null_matrix, axis=1)
     T_null = np.empty(B)
-    sumall = np.sum(null_smoothed, axis=1)
-    if standardise and recompute_sd_for_loo:
-        sumsqs = np.sum(null_smoothed**2, axis=1)
+
     for i in range(B):
-        ref_loo = (sumall - null_smoothed[:, i]) / (B - 1)
-        raw_diffs_loo = np.abs(null_smoothed[:, i] - ref_loo)
-        if standardise:
-            if recompute_sd_for_loo:
-                sd_loo = np.sqrt(_loo_var(null_smoothed, i, sumall, sumsqs, B))
-                mask = sd_loo < np.finfo(float).eps
-                if np.any(mask):
-                    non_zero_mean = (
-                        np.mean(sd_loo[~mask]) if np.any(~mask) else 1e-6
-                    )
-                    if non_zero_mean < np.finfo(float).eps:
-                        non_zero_mean = 1e-6
-                    sd_loo[mask] = non_zero_mean
-                diffs_loo = raw_diffs_loo / sd_loo
-            else:
-                diffs_loo = raw_diffs_loo / global_sd
+        loo_mean = (colsums - null_matrix[:, i]) / (B - 1)
+        diffs = np.abs(null_matrix[:, i] - loo_mean)
+        T_null[i] = _aggregator(diffs, aggregator_style)
+
+    return T_null
+
+
+###################
+# Core Algorithms
+###################
+
+
+def compute_sra(
+    ranked_lists: np.ndarray, config: SRAConfig, nitems: Optional[int] = None
+) -> SRAResult:
+    """
+    Compute the Sequential Rank Agreement (SRA) for a set of ranked lists.
+
+    This is the pure functional core of the SRA algorithm. It handles the case
+    of incomplete lists by imputing missing values through random resampling.
+
+    Parameters
+    ----------
+    ranked_lists : numpy.ndarray
+        Array of shape (n_lists, list_length) where each row is a ranked list.
+    config : SRAConfig
+        Configuration for SRA computation.
+    nitems : int, optional
+        Total number of items. If None, inferred from ranked_lists.
+
+    Returns
+    -------
+    result : SRAResult
+        Container for SRA computation results.
+    """
+    ranked_lists = np.array(ranked_lists, dtype=float)
+    num_lists, list_length = ranked_lists.shape
+
+    if nitems is None:
+        nitems = list_length
+    elif list_length < nitems:
+        # Pad with missing values
+        pad_width = nitems - list_length
+        pad = np.full((num_lists, pad_width), np.nan)
+        ranked_lists = np.concatenate([ranked_lists, pad], axis=1)
+
+    if np.isscalar(config.epsilon):
+        epsilons = np.full(nitems, float(config.epsilon))
+    else:
+        epsilons = np.asarray(config.epsilon, dtype=float)
+        if len(epsilons) != nitems:
+            raise ValueError(
+                f"Length of epsilon ({len(epsilons)}) must match nitems ({nitems})"
+            )
+
+    # Store SRA curves from each resample
+    sra_curves = np.zeros((config.B, nitems))
+    when_included = np.full(nitems, nitems + 1, dtype=float)
+
+    # For each resample, impute missing values and compute the SRA curve
+    for b in range(config.B):
+        imputed = np.empty_like(ranked_lists)
+        for i in range(num_lists):
+            list_i = ranked_lists[i, :]
+            observed_mask = ~np.isnan(list_i)
+            observed = list_i[observed_mask].astype(int)
+            missing_idx = np.where(~observed_mask)[0]
+
+            all_items = set(range(1, nitems + 1))
+            observed_set = set(observed)
+            missing_items = np.array(list(all_items - observed_set), dtype=int)
+
+            if missing_items.size > 0:
+                np.random.shuffle(missing_items)
+
+            new_list = list_i.copy()
+            for j, idx in enumerate(missing_idx):
+                if j < len(missing_items):
+                    new_list[idx] = missing_items[j]
+
+            imputed[i, :] = new_list
+
+        rank_mat = _reshape_rank_matrix(imputed)
+
+        if config.metric.lower() == "sd":
+            disagreements = np.var(rank_mat, axis=0, ddof=1)
+        elif config.metric.lower() == "mad":
+
+            def mad(x):
+                med = np.median(x)
+                return np.median(np.abs(x - med)) * 1.4826
+
+            disagreements = np.array(
+                [mad(rank_mat[:, j]) for j in range(nitems)]
+            )
         else:
-            diffs_loo = raw_diffs_loo
-        T_null[i] = _aggregator(diffs_loo, style=style)
-    p_value = (np.sum(T_null >= T_obs) + 1) / (B + 1)
-    return {
-        "p_value": p_value,
-        "T_obs": T_obs,
-        "T_null": T_null,
-        "style": style,
-        "window_size": window_size,
-        "standardise": standardise,
-    }
+            raise ValueError(f"Unsupported metric: {config.metric}")
+
+        sra_curve = np.zeros(nitems)
+        for d in range(1, nitems + 1):
+            prop = np.mean(rank_mat <= d, axis=0)
+            depth_set = prop > epsilons[d - 1]
+            if b == 0:
+                for j in range(nitems):
+                    if depth_set[j] and d < when_included[j]:
+                        when_included[j] = d
+
+            if np.any(depth_set):
+                sra_curve[d - 1] = np.mean(disagreements[depth_set])
+            else:
+                sra_curve[d - 1] = 0.0
+
+        sra_curves[b, :] = sra_curve
+
+    avg_sra = np.mean(sra_curves, axis=0)
+
+    if config.metric.lower() == "sd":
+        avg_sra = np.sqrt(avg_sra)
+
+    when_included[when_included > nitems] = np.inf
+
+    return SRAResult(values=avg_sra, config=config, when_included=when_included)
 
 
 def random_list_sra(
-    object_input: np.ndarray,
-    B: int = 1,
-    n: int = 1,
-    na_strings=None,
-    nitems: int = None,
-    metric: str = "sd",
-    epsilon: float = 0.0,
-) -> np.ndarray:
-    """
-    Generate simulated SRA curves using random permutations with enhanced features.
+    ranked_lists: np.ndarray | list[list[float]],
+    config: SRAConfig,
+    n_permutations: int = 100,
+    nitems: Optional[int] = None,
+) -> RandomListSRAResult:
+    ranked_lists = np.asarray(ranked_lists, dtype=float)
+    num_lists, list_length = ranked_lists.shape
 
-    Accepts either a list of ranked lists or a numpy array. The ranked lists may be
-    incomplete or contain missing values. Note that our Python convention is that each
-    row represents one ranked list.
-
-    Args:
-        object_input: List of lists/arrays or a 2D numpy array of ranked lists.
-        B: Number of randomisation runs for SRA imputation.
-        n: Number of permutation runs.
-        na_strings: Additional values (besides np.nan) to treat as missing.
-        nitems: Total number of items; if not provided, determined from the data.
-        metric: 'sd' (default) or 'mad'.
-        epsilon: Threshold for inclusion in S(d).
-
-    Returns:
-        A 2D numpy array of shape (list_length, n) where each column is a simulated SRA curve.
-    """
-    if na_strings is not None:
-        for na_val in na_strings:
-            object_input[object_input == na_val] = np.nan
-
-    num_lists, list_length = object_input.shape
-    notmiss = np.sum(~np.isnan(object_input), axis=1)
+    # If needed, pad out to nitems
     if nitems is None:
-        unique_non_na = (
-            len(np.unique(object_input[~np.isnan(object_input)]))
-            if np.any(~np.isnan(object_input))
-            else 1
-        )
-        nitems = max(list_length, unique_non_na, 1)
-    else:
-        nitems = max(
-            nitems,
-            list_length,
-            (
-                len(np.unique(object_input[~np.isnan(object_input)]))
-                if np.any(~np.isnan(object_input))
-                else 1
-            ),
-        )
+        nitems = list_length
+    elif list_length < nitems:
+        pad_width = nitems - list_length
+        pad = np.full((num_lists, pad_width), np.nan)
+        ranked_lists = np.concatenate([ranked_lists, pad], axis=1)
+        list_length = ranked_lists.shape[1]
 
-    # For each list, generate n random permutations (without replacement) of length equal to the number of observed items.
+    # Count how many items are actually non-missing in each row
+    notmiss = np.sum(~np.isnan(ranked_lists), axis=1).astype(int)
+
+    # Pre-generate random partial-permutations for each row
     sample_list = []
     for nn in notmiss:
-        nn = int(nn)
-        samples_for_list = [
-            np.random.permutation(np.arange(1, nitems + 1))[:nn]
-            for _ in range(n)
+        # nn is how many items are actually observed
+        # generate n_permutations permutations of [1..nitems], each truncated to length nn
+        row_samples = [
+            np.random.permutation(nitems)[:nn] + 1
+            for _ in range(n_permutations)
         ]
-        sample_list.append(samples_for_list)
+        sample_list.append(row_samples)
 
-    # For each permutation run, construct a new ranked list matrix.
+    # Now build each random replicate and compute SRA
     sra_results = []
-    for i in range(n):
+    for i in range(n_permutations):
+        # For each replicate i, assemble a new matrix from row i's partial permutations
         current_obj = np.full((num_lists, list_length), np.nan, dtype=float)
-        for j in range(num_lists):
-            nn = int(notmiss[j])
+        for row_idx in range(num_lists):
+            nn = notmiss[row_idx]
             if nn > 0:
-                current_obj[j, :nn] = sample_list[j][i][:nn]
-        # Compute SRA curve using the previously defined sra() function.
-        sra_curve = sra(
-            current_obj, epsilon=epsilon, B=B, nitems=nitems, metric=metric
-        )
+                current_obj[row_idx, :nn] = sample_list[row_idx][i]
+        # compute SRA on that entire matrix
+        sra_curve = compute_sra(current_obj, config, nitems).values
         sra_results.append(sra_curve)
-    return np.column_stack(sra_results)
+
+    # Combine into a distribution of shape (nitems, n_permutations)
+    null_distribution = np.column_stack(sra_results)
+    return RandomListSRAResult(
+        distribution=null_distribution,
+        config=config,
+        n_permutations=n_permutations,
+    )
 
 
-def test_delta_sra(
-    object1: np.ndarray,
-    object2: np.ndarray,
-    nullobject1: np.ndarray,
-    nullobject2: np.ndarray,
-    window_size: int = 1,
-    style: str = "l2",
-    standardise: bool = False,
-    recompute_sd_for_loo: bool = True,
-    use_normal_approx: bool = True,
-    tail_correction: bool = True,
-) -> dict:
+def test_sra(
+    observed_sra: np.ndarray, null_distribution: np.ndarray, config: TestConfig
+) -> TestResult:
     """
-    Compare two observed SRA curves via the difference in their aggregated statistics.
-
-    The function optionally smooths the curves using a rolling window,
-    standardises differences using row-wise standard deviations computed from the null curves,
-    and then computes both an empirical and a parametric (normal or t-based) p-value.
+    Test observed SRA values against null distribution.
 
     Parameters
     ----------
-    object1 : np.ndarray
-        Observed SRA curve for method 1 (1D array of length D).
-    object2 : np.ndarray
-        Observed SRA curve for method 2 (1D array of length D).
-    nullobject1 : np.ndarray
-        Null SRA curves for method 1 (2D array of shape (D, B)).
-    nullobject2 : np.ndarray
-        Null SRA curves for method 2 (2D array of shape (D, B)).
-    window_size : int, optional
-        Smoothing window size; if greater than 1 a rolling window average is applied.
-    style : str, optional
-        Aggregation style. Options include "l2" (sum-of-squares) or "max".
-    standardise : bool, optional
-        If True, differences are standardised by their estimated SD.
-    recompute_sd_for_loo : bool, optional
-        When standardising, recompute the leave‑one‑out SD rather than use the overall estimate.
-    use_normal_approx : bool, optional
-        Flag to use a parametric p‑value based on a (t‑distributed) normal approximation.
-    tail_correction : bool, optional
-        If True, apply a slight tail correction using a t-distribution with df=25.
+    observed_sra : numpy.ndarray
+        Observed SRA values.
+    null_distribution : numpy.ndarray
+        Null distribution of SRA values.
+    config : TestConfig
+        Configuration for the test.
 
     Returns
     -------
-    dict
-        A dictionary containing:
-          - p_value: The parametric p‑value.
-          - p_value_empirical: The empirical (permutation) p‑value.
-          - T_obs: The difference in aggregated statistics for the observed curves.
-          - T_null: A vector of differences from the null resamples.
-          - null_fit: A dict with keys "mean" and "sd" (if using normal approximation), else None.
-          - style, window_size, standardise, use_normal_approx, tail_correction.
+    result : TestResult
+        Container for test results.
     """
-    eps = np.finfo(float).eps
+    observed_sra = np.asarray(observed_sra)
+    null_distribution = np.asarray(null_distribution)
 
-    # Smooth observed curves if required
-    if window_size > 1:
-        obj1 = _smooth_sra_window(object1, window_size=window_size)
-        obj2 = _smooth_sra_window(object2, window_size=window_size)
-    else:
-        obj1, obj2 = object1, object2
-
-    # Smooth null curves along each column if required.
-    if window_size > 1:
-        nullobj1 = np.column_stack(
-            [
-                _smooth_sra_window(nullobject1[:, i], window_size=window_size)
-                for i in range(nullobject1.shape[1])
-            ]
-        )
-        nullobj2 = np.column_stack(
-            [
-                _smooth_sra_window(nullobject2[:, i], window_size=window_size)
-                for i in range(nullobject2.shape[1])
-            ]
-        )
-    # Else, keep as is.
-    B = nullobj1.shape[1]
-    if nullobj2.shape[1] != B:
-        raise ValueError(
-            "Both null matrices must have the same number of columns."
+    # Apply smoothing if requested
+    if config.window > 1:
+        observed_sra = smooth_sra_window(observed_sra, config.window)
+        null_distribution = np.apply_along_axis(
+            lambda n: smooth_sra_window(n, config.window), 0, null_distribution
         )
 
-    if standardise:
-        # Compute row-wise SD (ddof=1) for each null object.
-        global_sd1 = np.std(nullobj1, axis=1, ddof=1)
-        global_sd2 = np.std(nullobj2, axis=1, ddof=1)
-        # Replace any near-zero values by the mean of nonzero entries (or 1e-6).
-        for global_sd in (global_sd1, global_sd2):
-            mask = global_sd < eps
-            if np.any(mask):
-                non_zero_mean = (
-                    np.mean(global_sd[~mask]) if np.any(~mask) else 1e-6
-                )
-                if non_zero_mean < eps:
-                    non_zero_mean = 1e-6
-                global_sd[mask] = non_zero_mean
-    else:
-        global_sd1 = global_sd2 = None
+    # Compute test statistic
+    diffs_obs = np.abs(observed_sra - np.mean(null_distribution, axis=1))
+    T_obs = _aggregator(diffs_obs, style=config.style)
 
-    # Compute row means over null columns.
-    ref_all1 = np.mean(nullobj1, axis=1)
-    ref_all2 = np.mean(nullobj2, axis=1)
+    # Generate null distribution of test statistics
+    T_null = _generate_null_distribution(null_distribution, config.style)
 
-    raw_diffs_obs1 = np.abs(obj1 - ref_all1)
-    raw_diffs_obs2 = np.abs(obj2 - ref_all2)
-    if standardise:
-        diffs_obs1 = raw_diffs_obs1 / global_sd1
-        diffs_obs2 = raw_diffs_obs2 / global_sd2
-    else:
-        diffs_obs1, diffs_obs2 = raw_diffs_obs1, raw_diffs_obs2
+    # Compute empirical p-value
+    p_value_empirical = (np.sum(T_null >= T_obs) + 1) / (len(T_null) + 1)
 
-    T_obs1 = _aggregator(diffs_obs1, style=style)
-    T_obs2 = _aggregator(diffs_obs2, style=style)
+    # Use GPD if requested
+    gpd_results = None
+    p_value_gpd = None
+    gpd_fit = None
+
+    if config.use_gpd:
+        gpd_results = _calculate_gpd_pvalue(
+            T_obs, T_null, config.threshold_quantile
+        )
+        p_value_gpd = gpd_results["p_value_gpd"]
+        gpd_fit = gpd_results["gpd_fit"]
+
+    return TestResult(
+        p_value_empirical=p_value_empirical,
+        test_statistic=T_obs,
+        null_statistics=T_null,
+        config=config,
+        p_value_gpd=p_value_gpd,
+        gpd_fit=gpd_fit,
+    )
+
+
+def compare_sra(
+    sra1: np.ndarray,
+    sra2: np.ndarray,
+    null1: np.ndarray,
+    null2: np.ndarray,
+    config: TestConfig,
+) -> ComparisonResult:
+    """
+    Compare two SRA curves.
+
+    Parameters
+    ----------
+    sra1 : numpy.ndarray
+        First SRA curve.
+    sra2 : numpy.ndarray
+        Second SRA curve.
+    null1 : numpy.ndarray
+        Null distribution for first curve.
+    null2 : numpy.ndarray
+        Null distribution for second curve.
+    config : TestConfig
+        Configuration for the test.
+
+    Returns
+    -------
+    result : ComparisonResult
+        Container for comparison results.
+    """
+    sra1 = np.asarray(sra1)
+    sra2 = np.asarray(sra2)
+    null1 = np.asarray(null1)
+    null2 = np.asarray(null2)
+
+    # Apply smoothing if requested
+    if config.window > 1:
+        sra1 = smooth_sra_window(sra1, config.window)
+        sra2 = smooth_sra_window(sra2, config.window)
+        null1 = np.apply_along_axis(
+            lambda n: smooth_sra_window(n, config.window), 0, null1
+        )
+        null2 = np.apply_along_axis(
+            lambda n: smooth_sra_window(n, config.window), 0, null2
+        )
+
+    # Compute test statistics for each curve
+    T_obs1 = _aggregator(np.abs(sra1 - np.mean(null1, axis=1)), config.style)
+    T_obs2 = _aggregator(np.abs(sra2 - np.mean(null2, axis=1)), config.style)
+
+    # Compute observed difference
     T_obs = T_obs1 - T_obs2
 
-    # Prepare for leave-one-out (LOO) calculations.
-    T_null = np.zeros(B)
-    sumall1 = np.sum(nullobj1, axis=1)
-    sumall2 = np.sum(nullobj2, axis=1)
-    if standardise and recompute_sd_for_loo:
-        sumsqs1 = np.sum(nullobj1**2, axis=1)
-        sumsqs2 = np.sum(nullobj2**2, axis=1)
+    # Generate null distribution by comparing random permutations
+    combined = np.hstack([null1, null2])
+    B = combined.shape[1]
+    T_null = np.empty(B)
 
-    # Loop over each permutation (null column)
     for i in range(B):
-        # For nullobject1:
-        ref_loo1 = (sumall1 - nullobj1[:, i]) / (B - 1)
-        raw_diffs_loo1 = np.abs(nullobj1[:, i] - ref_loo1)
-        if standardise:
-            if recompute_sd_for_loo:
-                sd_loo1 = np.sqrt(_loo_var(nullobj1, i, sumall1, sumsqs1, B))
-                mask = sd_loo1 < eps
-                if np.any(mask):
-                    non_zero_mean = (
-                        np.mean(sd_loo1[~mask]) if np.any(~mask) else 1e-6
-                    )
-                    if non_zero_mean < eps:
-                        non_zero_mean = 1e-6
-                    sd_loo1[mask] = non_zero_mean
-                diffs_loo1 = raw_diffs_loo1 / sd_loo1
-            else:
-                diffs_loo1 = raw_diffs_loo1 / global_sd1
-        else:
-            diffs_loo1 = raw_diffs_loo1
-        T_null1 = _aggregator(diffs_loo1, style=style)
-
-        # For nullobject2:
-        ref_loo2 = (sumall2 - nullobj2[:, i]) / (B - 1)
-        raw_diffs_loo2 = np.abs(nullobj2[:, i] - ref_loo2)
-        if standardise:
-            if recompute_sd_for_loo:
-                sd_loo2 = np.sqrt(_loo_var(nullobj2, i, sumall2, sumsqs2, B))
-                mask = sd_loo2 < eps
-                if np.any(mask):
-                    non_zero_mean = (
-                        np.mean(sd_loo2[~mask]) if np.any(~mask) else 1e-6
-                    )
-                    if non_zero_mean < eps:
-                        non_zero_mean = 1e-6
-                    sd_loo2[mask] = non_zero_mean
-                diffs_loo2 = raw_diffs_loo2 / sd_loo2
-            else:
-                diffs_loo2 = raw_diffs_loo2 / global_sd2
-        else:
-            diffs_loo2 = raw_diffs_loo2
-        T_null2 = _aggregator(diffs_loo2, style=style)
-
-        T_null[i] = T_null1 - T_null2
-
-    p_value_empirical = (np.sum(T_null >= T_obs) + 1) / (B + 1)
-
-    if use_normal_approx:
-        null_mean = np.mean(T_null)
-        null_sd = np.std(T_null, ddof=1)
-        z_obs = (T_obs - null_mean) / null_sd
-        if tail_correction:
-            # Use t-distribution with df=25 for a slight tail correction.
-            p_value_parametric = t.sf(z_obs, df=25)
-        else:
-            p_value_parametric = norm.sf(z_obs)
-        if p_value_parametric < eps:
-            p_value_parametric = np.exp(norm.logsf(z_obs))
-    else:
-        p_value_parametric = p_value_empirical
-        null_mean, null_sd = None, None
-
-    return {
-        "p_value": p_value_parametric,
-        "p_value_empirical": p_value_empirical,
-        "T_obs": T_obs,
-        "T_null": T_null,
-        "null_fit": {"mean": null_mean, "sd": null_sd}
-        if use_normal_approx
-        else None,
-        "style": style,
-        "window_size": window_size,
-        "standardise": standardise,
-        "use_normal_approx": use_normal_approx,
-        "tail_correction": tail_correction,
-    }
-
-
-def survival_gpd(x: float, xi: float, beta: float) -> float:
-    """
-    Compute the survival function for a Generalised Pareto Distribution (GPD).
-
-    For xi near zero the GPD approximates an exponential tail.
-
-    Parameters
-    ----------
-    x : float
-        The value (or excess) at which to evaluate the survival.
-    xi : float
-        The shape parameter.
-    beta : float
-        The scale parameter.
-
-    Returns
-    -------
-    float
-        The survival probability.
-    """
-    if xi == 0:
-        return np.exp(-x / beta)
-    else:
-        inner = 1 + (xi * x / beta)
-        if inner <= 0:
-            return 0.0
-        else:
-            return inner ** (-1 / xi)
-
-
-def test_sra_gpd(
-    object_: np.ndarray,
-    nullobject: np.ndarray,
-    window_size: int = 1,
-    style: str = "l2",
-    standardise: bool = False,
-    recompute_sd_for_loo: bool = True,
-    threshold_quantile: float = 0.90,
-) -> dict:
-    """
-    Extend the SRA test by fitting a Generalised Pareto Distribution (GPD) to the tail
-    of the null distribution if the observed aggregated statistic is extreme.
-
-    First the standard test_sra procedure is run (assumed to be available) to obtain T_obs and T_null.
-    If T_obs is below the threshold (the quantile of T_null) or if there are fewer than 30 null values
-    in the tail, no tail fit is performed and the base result is returned.
-    Otherwise, a GPD is fit to the excesses over the threshold and used to calculate a tail-adjusted p-value.
-
-    Parameters
-    ----------
-    object_ : np.ndarray
-        Observed SRA curve (1D array).
-    nullobject : np.ndarray
-        Null SRA curves (2D array with shape (D, B)).
-    window_size : int, optional
-        Smoothing window size.
-    style : str, optional
-        Aggregation style ("l2" or "max").
-    standardise : bool, optional
-        Whether to standardise differences.
-    recompute_sd_for_loo : bool, optional
-        Whether to recompute leave-one-out standard deviations.
-    threshold_quantile : float, optional
-        Quantile (between 0 and 1) to use as the threshold for tail fitting.
-
-    Returns
-    -------
-    dict
-        A dictionary with the base test_sra results and (if applicable) additional keys:
-          - p_value_gpd: The tail-adjusted p-value.
-          - gpd_fit: A dict containing the fitted GPD parameters (xi, beta) and threshold.
-    """
-    # Run the base SRA test (assumed to be defined in your library)
-    base_result = test_sra(
-        observed_sra=object_,
-        null_sra=nullobject,
-        window_size=window_size,
-        style=style,
-        standardise=standardise,
-        recompute_sd_for_loo=recompute_sd_for_loo,
-    )
-
-    T_null = base_result["T_null"]
-    T_obs = base_result["T_obs"]
-
-    threshold = np.quantile(T_null, threshold_quantile)
-
-    if T_obs < threshold:
-        print("No tail fit needed")
-        return base_result
-
-    tail_data = T_null[T_null > threshold]
-    if tail_data.size < 30:
-        print(
-            "Fewer than 30 null T-values exceed threshold; GPD tail fit may be unstable. Returning the empirical result."
+        cols = np.random.choice(B, size=2, replace=False)
+        T1 = _aggregator(
+            np.abs(combined[:, cols[0]] - np.mean(combined, axis=1)),
+            config.style,
         )
-        return base_result
+        T2 = _aggregator(
+            np.abs(combined[:, cols[1]] - np.mean(combined, axis=1)),
+            config.style,
+        )
+        T_null[i] = T1 - T2
 
-    # Fit GPD to the excesses over the threshold.
-    excesses = tail_data - threshold
-    # Fix location to 0 (i.e. excesses) during fitting.
-    xi, loc, beta = genpareto.fit(excesses, floc=0)
+    # Compute p-value
+    p_value = (np.sum(T_null >= T_obs) + 1) / (B + 1)
 
-    # Compute tail-based p-value for T_obs.
-    if T_obs <= threshold:
-        p_value_gpd = np.mean(T_null >= T_obs)
-    else:
-        excess_obs = T_obs - threshold
-        tail_prob = genpareto.sf(excess_obs, c=xi, loc=0, scale=beta)
-        # Combine the empirical CDF at threshold with the tail fit.
-        F_threshold = np.mean(T_null < threshold)
-        p_value_gpd = F_threshold + (1 - F_threshold) * tail_prob
-
-    # Add the GPD tail-adjusted p-value and fit parameters to the result.
-    base_result.update(
-        {
-            "p_value_gpd": p_value_gpd,
-            "gpd_fit": {"xi": xi, "beta": beta, "threshold": threshold},
-        }
+    return ComparisonResult(
+        p_value=p_value,
+        test_statistic=T_obs,
+        null_statistics=T_null,
+        config=config,
     )
-    return base_result
+
+
+###################
+# Estimator Classes
+###################
+
+
+class RankData:
+    """Utility for handling and transforming ranked data."""
+
+    @staticmethod
+    def from_items(items_lists: list[list[Any]]) -> np.ndarray:
+        """Convert lists of items to numeric ranks.
+
+        Parameters
+        ----------
+        items_lists : list of lists
+            Each inner list contains items in their ranked order.
+
+        Returns
+        -------
+        rank_matrix : numpy.ndarray
+            Array of shape (len(items_lists), max_items) where each row
+            is a ranked list converted to numeric ranks.
+        """
+        result = []
+
+        # Find unique items across all lists
+        all_items = set()
+        for items in items_lists:
+            all_items.update(items)
+
+        # Create a mapping from items to integer IDs
+        item_to_id = {
+            item: idx + 1 for idx, item in enumerate(sorted(all_items))
+        }
+
+        # Convert each list to numeric IDs
+        for items in items_lists:
+            result.append([item_to_id[item] for item in items])
+
+        # Find maximum length and pad with NaN
+        max_len = max(len(lst) for lst in result)
+        padded_result = []
+
+        for lst in result:
+            padded = lst + [np.nan] * (max_len - len(lst))
+            padded_result.append(padded)
+
+        return np.array(padded_result)
+
+    @staticmethod
+    def from_scores(
+        scores: list[list[float]], ascending: bool = True
+    ) -> np.ndarray:
+        """Convert lists of scores to ranks (e.g., p-values, correlations).
+
+        Parameters
+        ----------
+        scores : list of lists
+            Each inner list contains numeric scores.
+        ascending : bool, default=True
+            If True, lower scores get lower ranks (e.g., for p-values).
+            If False, higher scores get lower ranks (e.g., for correlations).
+
+        Returns
+        -------
+        rank_matrix : numpy.ndarray
+            Array where each row contains the corresponding ranks.
+        """
+        result = []
+
+        for score_list in scores:
+            # Convert to numpy array
+            scores_array = np.array(score_list)
+
+            # Handle NaN values
+            mask = ~np.isnan(scores_array)
+            valid_scores = scores_array[mask]
+
+            # Get ranks (argsort of argsort gives ranks)
+            if ascending:
+                valid_ranks = np.argsort(np.argsort(valid_scores)) + 1
+            else:
+                valid_ranks = np.argsort(np.argsort(-valid_scores)) + 1
+
+            # Create full array with NaN for missing values
+            ranks = np.full_like(scores_array, np.nan)
+            ranks[mask] = valid_ranks
+
+            result.append(ranks)
+
+        return np.array(result)
+
+
+class SRA(BaseEstimator):
+    """Sequential Rank Agreement estimator.
+
+    Computes agreement between ranked lists as a function of list depth.
+
+    Parameters
+    ----------
+    epsilon : float or array-like, default=0.0
+        Threshold for an item to be included in S(d).
+    metric : {'sd', 'mad'}, default='sd'
+        Method to measure dispersion of ranks.
+    B : int, default=1
+        Number of bootstrap samples for handling missing values.
+    """
+
+    def __init__(
+        self,
+        epsilon: float | np.ndarray = 0.0,
+        metric: Literal["sd", "mad"] = "sd",
+        B: int = 1,
+    ):
+        super().__init__()
+        self.config = SRAConfig(epsilon=epsilon, metric=metric, B=B)
+        self.result_ = None
+
+    def generate(self, X: np.ndarray, nitems: Optional[int] = None) -> "SRA":
+        """
+        Compute SRA values for ranked lists X.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_lists, list_length)
+            Ranked lists data. Each row represents a list.
+        nitems : int, optional
+            Total number of items. If None, inferred from X.
+
+        Returns
+        -------
+        self : object
+            Fitted estimator.
+        """
+        X = self._validate_input(X)
+        self.result_ = compute_sra(X, self.config, nitems)
+        self.fitted_ = True
+        return self
+
+    @require_fitted
+    def get_result(self) -> SRAResult:
+        """Get the SRA computation result."""
+        return self.result_
+
+    @require_fitted
+    def values(self) -> np.ndarray:
+        """Get the SRA values."""
+        return self.result_.values
+
+    @require_fitted
+    def when_included(self) -> np.ndarray:
+        """Get the depth at which each item was first included."""
+        return self.result_.when_included
+
+    @require_fitted
+    def smooth(self, window_size: int = 10) -> np.ndarray:
+        """
+        Smooth the SRA curve using a rolling window average.
+
+        Parameters
+        ----------
+        window_size : int, default=10
+            Size of the rolling window.
+
+        Returns
+        -------
+        smoothed_values : ndarray
+            Smoothed SRA curve.
+        """
+        return self.result_.smooth(window_size)
+
+
+class RandomListSRA(BaseEstimator):
+    """Generate null distribution for SRA through permutation.
+
+    Parameters
+    ----------
+    epsilon : float or array-like, default=0.0
+        Threshold for an item to be included in S(d).
+    metric : {'sd', 'mad'}, default='sd'
+        Method to measure dispersion of ranks.
+    B : int, default=1
+        Number of bootstrap samples for handling missing values.
+    n_permutations : int, default=100
+        Number of permutations to generate.
+    n_jobs : int, default=1
+        Number of jobs for parallel processing. Use -1 to use all available cores.
+    """
+
+    def __init__(
+        self,
+        epsilon: float | np.ndarray = 0.0,
+        metric: Literal["sd", "mad"] = "sd",
+        B: int = 1,
+        n_permutations: int = 100,
+    ):
+        super().__init__()
+        self.config = SRAConfig(epsilon=epsilon, metric=metric, B=B)
+        self.n_permutations = n_permutations
+        self.result_ = None
+
+    def generate(
+        self, X: np.ndarray, nitems: Optional[int] = None
+    ) -> "RandomListSRA":
+        """
+        Generate null distribution of SRA values by permuting lists.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_lists, list_length)
+            Ranked lists data. Each row represents a list.
+        nitems : int, optional
+            Total number of items. If None, inferred from X.
+
+        Returns
+        -------
+        self : object
+            Fitted estimator.
+        """
+        X = self._validate_input(X)
+        self.result_ = random_list_sra(
+            X, self.config, self.n_permutations, nitems
+        )
+        self.fitted_ = True
+        return self
+
+    @require_fitted
+    def get_result(self) -> RandomListSRAResult:
+        """Get the null distribution generation result."""
+        return self.result_
+
+    @require_fitted
+    def distribution(self) -> np.ndarray:
+        """Get the null distribution matrix."""
+        return self.result_.distribution
+
+    @require_fitted
+    def confidence_band(
+        self, confidence: float = 0.95
+    ) -> dict[str, np.ndarray]:
+        """
+        Compute confidence band for the null distribution.
+
+        Parameters
+        ----------
+        confidence : float, default=0.95
+            Confidence level.
+
+        Returns
+        -------
+        band : dict
+            Dictionary with 'lower' and 'upper' arrays.
+        """
+        return self.result_.confidence_band(confidence)
+
+    @require_fitted
+    def quantiles(self, probs: list[float]) -> dict[float, np.ndarray]:
+        """
+        Compute quantiles of the null distribution for each depth.
+
+        Parameters
+        ----------
+        probs : list of float
+            Probability points at which to compute quantiles.
+
+        Returns
+        -------
+        quantiles : dict
+            Dictionary mapping probabilities to quantile arrays.
+        """
+        result = {}
+        for prob in probs:
+            result[prob] = np.quantile(self.result_.distribution, prob, axis=1)
+        return result
+
+
+class SRATest(BaseEstimator):
+    """Test for significance of SRA values against a null distribution.
+
+    Parameters
+    ----------
+    style : {'l2', 'max'}, default='l2'
+        Method to aggregate differences.
+    window : int, default=1
+        Size of smoothing window. Use 1 for no smoothing.
+    use_gpd : bool, default=False
+        Whether to use generalized Pareto distribution for extreme p-values.
+    threshold_quantile : float, default=0.90
+        Quantile to use as threshold for GPD fitting.
+    """
+
+    def __init__(
+        self,
+        style: Literal["l2", "max"] = "l2",
+        window: int = 1,
+        use_gpd: bool = False,
+        threshold_quantile: float = 0.90,
+    ):
+        super().__init__()
+        self.config = TestConfig(
+            style=style,
+            window=window,
+            use_gpd=use_gpd,
+            threshold_quantile=threshold_quantile,
+        )
+        self.result_ = None
+
+    def generate(
+        self,
+        observed_sra: SRAResult | np.ndarray,
+        null_dist: RandomListSRAResult | np.ndarray,
+    ) -> "SRATest":
+        """
+        Test observed SRA values against null distribution.
+
+        Parameters
+        ----------
+        observed_sra : SRAResult or array-like
+            Observed SRA values or result object.
+        null_dist : RandomListSRAResult or array-like
+            Null distribution of SRA values or result object.
+
+        Returns
+        -------
+        self : object
+            Fitted estimator.
+        """
+        # Extract values if result objects are provided
+        if isinstance(observed_sra, SRAResult):
+            observed_values = observed_sra.values
+        else:
+            observed_values = np.asarray(observed_sra)
+
+        if isinstance(null_dist, RandomListSRAResult):
+            null_values = null_dist.distribution
+        else:
+            null_values = np.asarray(null_dist)
+
+        # Validate input
+        if observed_values.ndim != 1:
+            raise ValueError("observed_sra must be a 1D array or SRAResult")
+        if null_values.ndim != 2:
+            raise ValueError(
+                "null_dist must be a 2D array or RandomListSRAResult"
+            )
+        if observed_values.shape[0] != null_values.shape[0]:
+            raise ValueError(
+                "observed_sra and null_dist must have same number of depths"
+            )
+
+        self.result_ = test_sra(observed_values, null_values, self.config)
+        self.fitted_ = True
+        return self
+
+    @require_fitted
+    def get_result(self) -> TestResult:
+        """Get the test result."""
+        return self.result_
+
+    @require_fitted
+    def p_value(self) -> float:
+        """Get the p-value (GPD-based if available, otherwise empirical)."""
+        return self.result_.p_value
+
+
+class SRACompare(BaseEstimator):
+    """Compare two SRA curves.
+
+    Parameters
+    ----------
+    style : {'l2', 'max'}, default='l2'
+        Method to aggregate differences.
+    window : int, default=1
+        Size of smoothing window. Use 1 for no smoothing.
+    """
+
+    def __init__(self, style: Literal["l2", "max"] = "l2", window: int = 1):
+        super().__init__()
+        self.config = TestConfig(style=style, window=window)
+        self.result_ = None
+
+    def generate(
+        self,
+        sra1: SRAResult | np.ndarray,
+        sra2: SRAResult | np.ndarray,
+        null1: RandomListSRAResult | np.ndarray,
+        null2: RandomListSRAResult | np.ndarray,
+    ) -> "SRACompare":
+        """
+        Compare two SRA curves.
+
+        Parameters
+        ----------
+        sra1 : SRAResult or array-like
+            First SRA curve or result object.
+        sra2 : SRAResult or array-like
+            Second SRA curve or result object.
+        null1 : RandomListSRAResult or array-like
+            Null distribution for first curve or result object.
+        null2 : RandomListSRAResult or array-like
+            Null distribution for second curve or result object.
+
+        Returns
+        -------
+        self : object
+            Fitted estimator.
+        """
+        # Extract values if result objects are provided
+        if isinstance(sra1, SRAResult):
+            sra1_values = sra1.values
+        else:
+            sra1_values = np.asarray(sra1)
+
+        if isinstance(sra2, SRAResult):
+            sra2_values = sra2.values
+        else:
+            sra2_values = np.asarray(sra2)
+
+        if isinstance(null1, RandomListSRAResult):
+            null1_values = null1.distribution
+        else:
+            null1_values = np.asarray(null1)
+
+        if isinstance(null2, RandomListSRAResult):
+            null2_values = null2.distribution
+        else:
+            null2_values = np.asarray(null2)
+
+        # Validate input
+        if sra1_values.ndim != 1 or sra2_values.ndim != 1:
+            raise ValueError(
+                "SRA curves must be 1D arrays or SRAResult objects"
+            )
+        if sra1_values.shape[0] != sra2_values.shape[0]:
+            raise ValueError("SRA curves must have same length")
+        if null1_values.ndim != 2 or null2_values.ndim != 2:
+            raise ValueError(
+                "Null distributions must be 2D arrays or RandomListSRAResult objects"
+            )
+
+        self.result_ = compare_sra(
+            sra1_values, sra2_values, null1_values, null2_values, self.config
+        )
+        self.fitted_ = True
+        return self
+
+    @require_fitted
+    def get_result(self) -> ComparisonResult:
+        """Get the comparison result."""
+        return self.result_
+
+    @require_fitted
+    def p_value(self) -> float:
+        """Get the p-value for the comparison."""
+        return self.result_.p_value
+
+
+class RankPipeline:
+    """Builder for common rank analysis pipelines.
+
+    This utility class provides a fluent API for building common analysis
+    pipelines for ranked data, making it easy to perform typical analyses
+    with minimal code.
+
+    Attributes
+    ----------
+    ranked_data : numpy.ndarray
+        Ranked data for analysis.
+    sra_config : SRAConfig
+        Configuration for SRA computation.
+    sra : SRA
+        SRA estimator.
+    null_config : dict
+        Configuration for null distribution generation.
+    null_dist : RandomListSRA
+        Null distribution estimator.
+    test_config : TestConfig
+        Configuration for significance testing.
+    test : SRATest
+        Test estimator.
+    """
+
+    def __init__(self):
+        self.ranked_data = None
+        self.sra_config = None
+        self.sra = None
+        self.null_config = None
+        self.null_dist = None
+        self.test_config = None
+        self.test = None
+
+    def with_ranked_data(self, data: np.ndarray) -> "RankPipeline":
+        """
+        Set the ranked data for analysis.
+
+        Parameters
+        ----------
+        data : array-like
+            Ranked lists data. Each row represents a list.
+
+        Returns
+        -------
+        self : RankPipeline
+            For method chaining.
+        """
+        self.ranked_data = np.asarray(data)
+        return self
+
+    def with_items_lists(self, items_lists: list[list[Any]]) -> "RankPipeline":
+        """
+        Set ranked data from lists of items.
+
+        Parameters
+        ----------
+        items_lists : list of lists
+            Each inner list contains items in their ranked order.
+
+        Returns
+        -------
+        self : RankPipeline
+            For method chaining.
+        """
+        self.ranked_data = RankData.from_items(items_lists)
+        return self
+
+    def with_scores(
+        self, scores: list[list[float]], ascending: bool = True
+    ) -> "RankPipeline":
+        """
+        Set ranked data from lists of scores.
+
+        Parameters
+        ----------
+        scores : list of lists
+            Each inner list contains numeric scores.
+        ascending : bool, default=True
+            If True, lower scores get lower ranks (e.g., for p-values).
+            If False, higher scores get lower ranks (e.g., for correlations).
+
+        Returns
+        -------
+        self : RankPipeline
+            For method chaining.
+        """
+        self.ranked_data = RankData.from_scores(scores, ascending=ascending)
+        return self
+
+    def compute_sra(
+        self,
+        epsilon: float | np.ndarray = 0.0,
+        metric: Literal["sd", "mad"] = "sd",
+        B: int = 1,
+        nitems: Optional[int] = None,
+    ) -> "RankPipeline":
+        """
+        Compute SRA for the ranked data.
+
+        Parameters
+        ----------
+        epsilon : float or array-like, default=0.0
+            Threshold for an item to be included in S(d).
+        metric : {'sd', 'mad'}, default='sd'
+            Method to measure dispersion of ranks.
+        B : int, default=1
+            Number of bootstrap samples for handling missing values.
+        nitems : int, optional
+            Total number of items. If None, inferred from ranked_data.
+
+        Returns
+        -------
+        self : RankPipeline
+            For method chaining.
+        """
+        if self.ranked_data is None:
+            raise ValueError("Ranked data must be set before computing SRA")
+
+        self.sra_config = SRAConfig(epsilon=epsilon, metric=metric, B=B)
+        self.sra = SRA(epsilon=epsilon, metric=metric, B=B).generate(
+            self.ranked_data, nitems=nitems
+        )
+
+        return self
+
+    def random_list_sra(
+        self,
+        n_permutations: int = 100,
+        nitems: Optional[int] = None,
+    ) -> "RankPipeline":
+        """
+        Generate null distribution for the ranked data.
+
+        Parameters
+        ----------
+        n_permutations : int, default=100
+            Number of permutations to generate.
+        nitems : int, optional
+            Total number of items. If None, inferred from ranked_data.
+        n_jobs : int, default=1
+            Number of jobs for parallel processing. Use -1 to use all available cores.
+
+        Returns
+        -------
+        self : RankPipeline
+            For method chaining.
+        """
+        if self.ranked_data is None:
+            raise ValueError(
+                "Ranked data must be set before generating null distribution"
+            )
+
+        if self.sra_config is None:
+            warnings.warn("Using default SRA parameters for null distribution")
+            self.sra_config = SRAConfig()
+
+        self.null_config = {"n_permutations": n_permutations}
+
+        self.null_dist = RandomListSRA(
+            epsilon=self.sra_config.epsilon,
+            metric=self.sra_config.metric,
+            B=self.sra_config.B,
+            n_permutations=n_permutations,
+        ).generate(self.ranked_data, nitems=nitems)
+
+        return self
+
+    def test_significance(
+        self,
+        style: Literal["l2", "max"] = "l2",
+        window: int = 1,
+        use_gpd: bool = False,
+        threshold_quantile: float = 0.90,
+    ) -> "RankPipeline":
+        """
+        Test significance of observed SRA against null distribution.
+
+        Parameters
+        ----------
+        style : {'l2', 'max'}, default='l2'
+            Method to aggregate differences.
+        window : int, default=1
+            Size of smoothing window. Use 1 for no smoothing.
+        use_gpd : bool, default=False
+            Whether to use generalized Pareto distribution for extreme p-values.
+        threshold_quantile : float, default=0.90
+            Quantile to use as threshold for GPD fitting.
+
+        Returns
+        -------
+        self : RankPipeline
+            For method chaining.
+        """
+        if self.sra is None:
+            raise ValueError("SRA must be computed before testing significance")
+        if self.null_dist is None:
+            raise ValueError(
+                "Null distribution must be generated before testing significance"
+            )
+
+        self.test_config = TestConfig(
+            style=style,
+            window=window,
+            use_gpd=use_gpd,
+            threshold_quantile=threshold_quantile,
+        )
+
+        self.test = SRATest(
+            style=style,
+            window=window,
+            use_gpd=use_gpd,
+            threshold_quantile=threshold_quantile,
+        ).generate(self.sra.get_result(), self.null_dist.get_result())
+
+        return self
+
+    def build(self) -> dict[str, Any]:
+        """
+        Build and return the analysis results.
+
+        Returns
+        -------
+        results : dict
+            Dictionary containing analysis results.
+        """
+        result = {}
+
+        if self.sra is not None:
+            result["sra"] = self.sra
+            result["sra_result"] = self.sra.get_result()
+
+        if self.null_dist is not None:
+            result["null_distribution"] = self.null_dist
+            result["null_result"] = self.null_dist.get_result()
+
+            if self.sra is not None:
+                result["confidence_band"] = self.null_dist.confidence_band()
+
+        if self.test is not None:
+            result["test"] = self.test
+            result["test_result"] = self.test.get_result()
+            result["p_value"] = self.test.p_value()
+            result["significant"] = self.test.p_value() < 0.05
+
+        return result
+
+
+###################
+# Example Usage
+###################
+
+
+def example_usage():
+    """
+    Demonstrate example usage of the SuperRanker package.
+    """
+    # Sample ranked lists
+    ranks = np.array(
+        [
+            [1, 2, 3, 4, 5, 6, 7, 8],
+            [1, 2, 3, 5, 6, 7, 4, 8],
+            [1, 5, 3, 4, 2, 8, 7, 6],
+        ]
+    )
+
+    # Using the Pipeline API
+    print("Using Pipeline API:")
+    results = (
+        RankPipeline()
+        .with_ranked_data(ranks)
+        .compute_sra(epsilon=0.0, metric="sd", B=1)
+        .random_list_sra(n_permutations=10000)
+        .test_significance(style="max", window=1, use_gpd=False)
+        .build()
+    )
+
+    print(f"SRA first 5 values: {results['sra_result'].values[:5]}")
+    print(f"P-value: {results['p_value']}")
+    print(f"Significant: {results['significant']}")
+
+    # Using the direct API
+    print("\nUsing Direct API:")
+    sra_config = SRAConfig(epsilon=0.0, metric="sd", B=1)
+    sra_estimator = SRA(
+        epsilon=sra_config.epsilon, metric=sra_config.metric, B=sra_config.B
+    ).generate(ranks)
+    sra_result = sra_estimator.get_result()
+
+    null_estimator = RandomListSRA(
+        epsilon=sra_config.epsilon,
+        metric=sra_config.metric,
+        B=sra_config.B,
+        n_permutations=10000,
+    ).generate(ranks)
+    null_result = null_estimator.get_result()
+
+    test_config = TestConfig(style="max", use_gpd=False)
+    test = SRATest(
+        style=test_config.style, use_gpd=test_config.use_gpd
+    ).generate(sra_result, null_result)
+    test_result = test.get_result()
+
+    print(f"Direct SRA first 5 values: {sra_result.values[:5]}")
+    print(f"Direct P-value: {test_result.p_value}")
+
+    # Working with items directly
+    print("\nWorking with Item Lists:")
+    gene_lists = [
+        [
+            "Gene1",
+            "Gene2",
+            "Gene3",
+            "Gene4",
+            "Gene5",
+            "Gene6",
+            "Gene7",
+            "Gene8",
+        ],
+        [
+            "Gene1",
+            "Gene2",
+            "Gene3",
+            "Gene5",
+            "Gene6",
+            "Gene7",
+            "Gene4",
+            "Gene8",
+        ],
+        [
+            "Gene1",
+            "Gene5",
+            "Gene3",
+            "Gene4",
+            "Gene2",
+            "Gene8",
+            "Gene7",
+            "Gene6",
+        ],
+    ]
+
+    # With the same parameters as the original example
+    results_genes = (
+        RankPipeline()
+        .with_items_lists(gene_lists)
+        .compute_sra(epsilon=0.0, metric="sd", B=1)
+        .random_list_sra(n_permutations=10000)
+        .test_significance(style="max", window=1, use_gpd=False)
+        .build()
+    )
+
+    print(f"Gene SRA values: {results_genes['sra_result'].values[:5]}")
+    print(f"Gene test p-value: {results_genes['p_value']}")
+    print(f"Significant: {results_genes['significant']}")
+    # Compare two methods
+    print("\nComparing Two Methods:")
+    method1_ranks = np.array(
+        [[1, 2, 3, 4, 5, 6, 7, 8], [1, 2, 3, 5, 6, 7, 4, 8]]
+    )
+
+    method2_ranks = np.array(
+        [[1, 5, 3, 4, 2, 8, 7, 6], [2, 1, 5, 3, 4, 7, 8, 6]]
+    )
+
+    # Calculate SRAs for both methods
+    sra1 = SRA().generate(method1_ranks).get_result()
+    sra2 = SRA().generate(method2_ranks).get_result()
+
+    # Generate null distributions
+    null1 = (
+        RandomListSRA(n_permutations=50).generate(method1_ranks).get_result()
+    )
+    null2 = (
+        RandomListSRA(n_permutations=50).generate(method2_ranks).get_result()
+    )
+
+    # Compare methods
+    compare = SRACompare().generate(sra1, sra2, null1, null2)
+    compare_result = compare.get_result()
+
+    print(f"Method comparison p-value: {compare_result.p_value}")
+
+
+if __name__ == "__main__":
+    example_usage()
