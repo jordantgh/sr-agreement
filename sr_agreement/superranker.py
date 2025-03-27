@@ -1171,7 +1171,8 @@ def compare_sra(
     config: TestConfig,
 ) -> ComparisonResult:
     """
-    Compare two SRA curves based on their deviation from their respective nulls.
+    Compare two SRA curves based on their deviation from their respective nulls,
+    preserving permutation pairing.
 
     Parameters
     ----------
@@ -1180,9 +1181,10 @@ def compare_sra(
     sra2 : numpy.ndarray
         Second SRA curve (1D array).
     null1 : numpy.ndarray
-        Null distribution for first curve (2D array).
+        Null distribution for first curve (2D array, depths x permutations).
     null2 : numpy.ndarray
-        Null distribution for second curve (2D array).
+        Null distribution for second curve (2D array, depths x permutations).
+        Must have the same number of permutations as null1.
     config : TestConfig
         Configuration for the test (style, window).
 
@@ -1190,13 +1192,18 @@ def compare_sra(
     -------
     result : ComparisonResult
         Container for comparison results.
+
+    Raises
+    ------
+    ValueError
+        If inputs have incompatible shapes or null distributions have different
+        numbers of permutations.
     """
     sra1 = np.asarray(sra1)
     sra2 = np.asarray(sra2)
     null1 = np.asarray(null1)
     null2 = np.asarray(null2)
 
-    # Basic validation
     if sra1.ndim != 1 or sra2.ndim != 1:
         raise ValueError("SRA curves must be 1D arrays.")
     if null1.ndim != 2 or null2.ndim != 2:
@@ -1209,10 +1216,13 @@ def compare_sra(
         raise ValueError(
             "All inputs must have the same number of depths (first dimension)."
         )
-    if null1.shape[1] == 0 or null2.shape[1] == 0:
+    if null1.shape[1] != null2.shape[1]:
+        raise ValueError(
+            "Null distributions must have the same number of permutations (columns) for comparison."
+        )
+    if null1.shape[1] == 0:
         raise ValueError("Null distributions cannot have zero permutations.")
 
-    # Apply smoothing if requested
     if config.window > 1:
         sra1_smooth = smooth_sra_window(sra1, config.window)
         sra2_smooth = smooth_sra_window(sra2, config.window)
@@ -1228,7 +1238,6 @@ def compare_sra(
         null1_smooth = null1
         null2_smooth = null2
 
-    # Compute test statistics for each observed curve relative to its null mean
     mean_null1 = np.nanmean(null1_smooth, axis=1)
     mean_null2 = np.nanmean(null2_smooth, axis=1)
 
@@ -1238,84 +1247,34 @@ def compare_sra(
     T_obs1 = _aggregator(diffs_obs1, config.style)
     T_obs2 = _aggregator(diffs_obs2, config.style)
 
-    # Observed difference in test statistics
-    T_obs = (
-        T_obs1 - T_obs2
-    )  # Or abs(T_obs1 - T_obs2)? Original uses subtraction.
+    T_obs = T_obs1 - T_obs2
 
-    # Generate null distribution of the *difference* in test statistics
-    # Combine null distributions
-    combined_null = np.hstack([null1_smooth, null2_smooth])
-    B_total = combined_null.shape[1]
-    B1 = null1_smooth.shape[1]
-    # B2 = null2_smooth.shape[1] # B_total = B1 + B2
+    T_null1 = _generate_null_distribution(null1_smooth, config.style)
+    T_null2 = _generate_null_distribution(null2_smooth, config.style)
 
-    # We need to simulate drawing one curve from null1 and one from null2 many times.
-    # A simpler approach (used in original paper?) is to compute stats for ALL null curves
-    # relative to the COMBINED null mean, then compare distributions. Let's try that.
+    T_null_diff = T_null1 - T_null2
 
-    mean_combined_null = np.nanmean(combined_null, axis=1)
+    valid_T_null_diff = T_null_diff[~np.isnan(T_null_diff)]
 
-    # Calculate test stat for every column in the combined null distribution
-    T_null_all = np.full(B_total, np.nan)
-    for i in range(B_total):
-        diffs_null_i = np.abs(combined_null[:, i] - mean_combined_null)
-        T_null_all[i] = _aggregator(diffs_null_i, config.style)
-
-    # Separate the calculated statistics back into original groups
-    T_null_group1 = T_null_all[:B1]
-    T_null_group2 = T_null_all[B1:]
-
-    # Filter NaNs within each group
-    T_null_group1_valid = T_null_group1[~np.isnan(T_null_group1)]
-    T_null_group2_valid = T_null_group2[~np.isnan(T_null_group2)]
-
-    # Check if we have enough valid stats in both groups
-    if T_null_group1_valid.size == 0 or T_null_group2_valid.size == 0:
+    if valid_T_null_diff.size == 0:
         warnings.warn(
-            "Could not compute comparison p-value; one or both null groups lack valid test statistics."
+            "Could not compute comparison p-value; null difference distribution lacks valid values."
         )
         p_value = np.nan
-        T_null_diff_dist = np.array([np.nan])  # Placeholder
     elif np.isnan(T_obs):
-        p_value = np.nan
-        T_null_diff_dist = np.array([np.nan])
         warnings.warn(
             "Could not compute comparison p-value; observed test statistic difference is NaN."
         )
+        p_value = np.nan
     else:
-        # Generate null distribution of the difference by sampling permutations
-        # To maintain independence, sample with replacement if B1 != B2? Or just use all pairs?
-        # Let's use permutation approach: calculate diff for all pairs formed by shuffling labels.
-        # A simpler approximation: difference between the two distributions of T_null stats.
-        # Use random pairing (assuming large enough B1, B2)
-        n_samples = min(len(T_null_group1_valid), len(T_null_group2_valid))
-        if n_samples == 0:  # Should be caught above, but defensive check
-            p_value = np.nan
-            T_null_diff_dist = np.array([np.nan])
-        else:
-            # Sample indices without replacement for pairing
-            idx1 = np.random.choice(
-                len(T_null_group1_valid), n_samples, replace=False
-            )
-            idx2 = np.random.choice(
-                len(T_null_group2_valid), n_samples, replace=False
-            )
-            T_null_diff_dist = (
-                T_null_group1_valid[idx1] - T_null_group2_valid[idx2]
-            )
-
-            # Compute two-sided p-value? Original seems one-sided (T_null >= T_obs)
-            # Let's stick to one-sided based on T_obs = T_obs1 - T_obs2
-            p_value = (np.sum(T_null_diff_dist >= T_obs) + 1) / (
-                len(T_null_diff_dist) + 1
-            )
+        p_value = (np.sum(valid_T_null_diff >= T_obs) + 1) / (
+            len(valid_T_null_diff) + 1
+        )
 
     return ComparisonResult(
         p_value=p_value,
         test_statistic=T_obs,
-        # Return the distribution of differences used for p-value calculation
-        null_statistics=T_null_diff_dist,
+        null_statistics=T_null_diff,
         config=config,
     )
 
