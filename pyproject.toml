@@ -1,14 +1,15 @@
 [project]
 name = "sr-agreement"
-version = "0.0.1"
+version = "0.0.3"
 description = "This is a python implementation of https://github.com/tagteam/SuperRanker, based on Ekstrøm et al (2019) 'Sequential rank agreement methods for comparison of ranked lists'."
 authors = [{ name = "Jordan Taylor", email = "jtaylor81284@gmail.com" }]
 readme = "README.md"
 keywords = ['python']
-requires-python = ">=3.9,<4.0"
+requires-python = ">=3.11,<4.0"
 dependencies = [
-    "numpy>=2.2.4",
-    "scipy>=1.15.2",
+    "numpy>=2.2.0",
+    "scipy==1.15.2",
+    "ma-utils==0.0.3",
 ]
 classifiers = [
     "Intended Audience :: Developers",
@@ -29,6 +30,7 @@ Repository = "https://github.com/jordantgh/sr-agreement"
 dev = [
   "pytest>=8.2.1",
   "pandas>=2.0.0",
+  "pytest-mock>=3.10.0",
 ]
 
 [build-system]
