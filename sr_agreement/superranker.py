@@ -8,9 +8,42 @@ and testing the significance of rank agreement.
 import functools
 import warnings
 from dataclasses import dataclass
-from typing import Literal, Optional, Any
+from typing import Literal, Optional, Any, Dict, Tuple
 import numpy as np
-from scipy.stats import genpareto
+from scipy.stats import genpareto, rankdata
+from enum import Enum
+import pandas as pd
+import collections.abc
+
+# Import necessary components from the adapter module
+try:
+    from ma_utils.rank_array_adapter import (
+        convert_rank_data,
+        RankShape,
+        RankDataAdapter,
+        _validate_rankcol_no_midrow_nulls,
+        _validate_rankcol_no_duplicates,
+    )
+except ImportError:
+    # Provide dummy definitions if the module is not found,
+    # though the relevant functions will fail.
+    warnings.warn(
+        "rank_array_adapter module not found. Functionality relying on it will fail."
+    )
+
+    class RankShape(str, Enum):
+        LISTROW_RANKCOL = "listrow_rankcol"
+        LISTCOL_RANKROW = "listcol_rankrow"
+        LISTROW_ITEMCOL = "listrow_itemcol"
+        LISTCOL_ITEMROW = "listcol_itemrow"
+
+    @dataclass
+    class RankDataAdapter:
+        data: np.ndarray
+        id_to_index_mapping: Dict[float, int]
+
+    def convert_rank_data(*args, **kwargs) -> RankDataAdapter:
+        raise NotImplementedError("rank_array_adapter module is required.")
 
 
 def require_generated(method):
@@ -73,6 +106,7 @@ class SRAConfig:
                 raise ValueError(
                     "All values in epsilon array must be between 0 and 1"
                 )
+            # Epsilon array length validation happens inside compute_sra based on nitems
         else:
             raise TypeError(
                 f"Epsilon must be float or numpy.ndarray, got {type(self.epsilon)}"
@@ -133,11 +167,12 @@ class SRAResult:
     Attributes
     ----------
     values : numpy.ndarray
-        SRA values for each depth.
+        SRA values for each depth (1 to nitems). Shape (nitems,).
     config : SRAConfig
         Configuration used for computation.
     when_included : numpy.ndarray, optional
-        Depth at which each item was first included.
+        Depth at which each item (1 to nitems) was first included.
+        Shape (nitems,). Index corresponds to item_id - 1. np.inf if never included.
     """
 
     values: np.ndarray
@@ -179,7 +214,7 @@ class RandomListSRAResult:
     ----------
     distribution : numpy.ndarray
         Matrix of shape (n_depths, n_permutations) containing SRA values
-        for each permutation.
+        for each permutation. n_depths is typically nitems.
     config : SRAConfig
         Configuration used for computation.
     n_permutations : int
@@ -327,6 +362,15 @@ class BaseEstimator:
             raise ValueError(
                 "Input must be a 2D array with shape (n_lists, list_length)"
             )
+        # Ensure numeric type for internal processing
+        if not np.issubdtype(X.dtype, np.number):
+            # Attempt conversion if possible (e.g., object array of numbers)
+            try:
+                X = X.astype(float)
+            except ValueError as e:
+                raise ValueError(
+                    "Input array must be numeric or convertible to numeric."
+                ) from e
         return X
 
 
@@ -335,27 +379,56 @@ class BaseEstimator:
 ###################
 
 
-def _reshape_rank_matrix(ranked_lists_array: np.ndarray) -> np.ndarray:
+# Use the robust converter instead of the old _reshape_rank_matrix
+def _reshape_to_item_cols(
+    ranked_lists_array: np.ndarray,
+) -> Tuple[np.ndarray, Dict[float, int]]:
     """
-    Create a reshaped rank matrix from the input ranked lists.
+    Converts a LISTROW_RANKCOL array (item IDs in cells) to a
+    LISTROW_ITEMCOL array (ranks in cells, columns indexed by item)
+    using the robust convert_rank_data function.
 
     Parameters
     ----------
     ranked_lists_array : numpy.ndarray
-        Array of shape (num_lists, nitems) where each row is a ranked list.
+        Array in LISTROW_RANKCOL format (shape num_lists, list_length).
+        Values are numeric item IDs. Assumed validated & numeric.
 
     Returns
     -------
-    rank_matrix : numpy.ndarray
-        Array of shape (num_lists, nitems) where rank_matrix[i, j]
-        is the rank (1-indexed) of item (j+1) in list i.
+    rank_matrix : np.ndarray
+        Array in LISTROW_ITEMCOL format (shape num_lists, num_unique_items).
+        Values are ranks (1-based). Columns correspond to unique items found,
+        ordered numerically by their original ID. NaNs indicate an item was
+        not ranked in a list.
+    id_to_index_map : Dict[float, int]
+        Mapping from original numeric item ID to the column index in rank_matrix.
+
+    Raises
+    ------
+    ValueError
+        Propagated from convert_rank_data if input constraints are violated
+        or expansion fails.
+    ImportError
+        If rank_array_adapter is not installed/found.
     """
-    num_lists, nitems = ranked_lists_array.shape
-    rank_matrix = np.zeros((num_lists, nitems), dtype=int)
-    rows = np.arange(num_lists)[:, np.newaxis]
-    cols = ranked_lists_array.astype(int) - 1
-    rank_matrix[rows, cols] = np.tile(np.arange(1, nitems + 1), (num_lists, 1))
-    return rank_matrix
+    try:
+        adapter_result = convert_rank_data(
+            data=ranked_lists_array,
+            from_shape=RankShape.LISTROW_RANKCOL,
+            to_shape=RankShape.LISTROW_ITEMCOL,
+            na_value=np.nan,  # Use NaN for missing ranks
+        )
+        return adapter_result.data, adapter_result.id_to_index_mapping
+    except NameError:  # If convert_rank_data was not imported
+        raise ImportError(
+            "rank_array_adapter module is required for robust reshaping."
+        )
+    except ValueError as e:
+        # Add context if helpful
+        raise ValueError(
+            f"Error reshaping rank matrix using convert_rank_data: {e}"
+        )
 
 
 def smooth_sra_window(
@@ -379,24 +452,53 @@ def smooth_sra_window(
     n = len(sra_values)
     half_w = (window_size - 1) // 2
 
-    if window_size > n:
-        return np.full(n, np.mean(sra_values))
+    if window_size <= 1 or n <= 1:
+        return sra_values.copy()
 
-    cs = np.concatenate(([0], np.cumsum(sra_values)))
-    smoothed = np.empty(n)
+    if window_size >= n:
+        # If window is larger than array, return array average
+        mean_val = np.nanmean(sra_values)  # Use nanmean
+        return np.full(n, mean_val if not np.isnan(mean_val) else 0.0)
 
-    for i in range(n):
-        start_idx = max(0, i - half_w)
-        end_idx = min(n - 1, i + half_w)
-        count = end_idx - start_idx + 1
-        smoothed[i] = (cs[end_idx + 1] - cs[start_idx]) / count
+    # Use convolution for efficient rolling mean, handling NaNs
+    weights = np.ones(window_size) / window_size
+    # Pad with edge values to handle boundaries better than zero padding
+    padded_sra = np.pad(sra_values.astype(float), half_w, mode="edge")
+
+    # Handle NaNs: Calculate weighted sum and count of non-NaNs separately
+    valid_mask = ~np.isnan(padded_sra)
+    padded_sra_zeros = np.where(valid_mask, padded_sra, 0)
+
+    weighted_sum = np.convolve(padded_sra_zeros, weights, mode="valid")
+    valid_count = (
+        np.convolve(valid_mask.astype(float), weights, mode="valid")
+        * window_size
+    )
+
+    # Avoid division by zero where count is zero
+    smoothed = np.full_like(weighted_sum, np.nan)
+    non_zero_mask = valid_count > 1e-9  # Use tolerance for float comparison
+    smoothed[non_zero_mask] = weighted_sum[non_zero_mask] / (
+        valid_count[non_zero_mask] / window_size
+    )
+
+    # If any result is NaN (e.g., all NaNs in window), fill with 0 or another strategy?
+    smoothed = np.nan_to_num(smoothed, nan=0.0)
+
+    # Ensure output has the same length as input
+    if len(smoothed) > n:
+        # This might happen depending on convolution implementation details, trim if needed
+        smoothed = smoothed[:n]
+    elif len(smoothed) < n:
+        # Should not happen with 'valid' mode and correct padding, but handle defensively
+        smoothed = np.pad(smoothed, (0, n - len(smoothed)), mode="edge")
 
     return smoothed
 
 
 def _aggregator(diffs: np.ndarray, style: str = "l2") -> float:
     """
-    Aggregate a vector of differences.
+    Aggregate a vector of differences. Handles NaNs by ignoring them.
 
     Parameters
     ----------
@@ -408,12 +510,18 @@ def _aggregator(diffs: np.ndarray, style: str = "l2") -> float:
     Returns
     -------
     aggregated_value : float
-        Aggregated value.
+        Aggregated value. Returns 0.0 if diffs contains only NaNs.
     """
+    valid_diffs = diffs[~np.isnan(diffs)]
+    if valid_diffs.size == 0:
+        return 0.0
+
     if style == "max":
-        return np.max(diffs)
-    else:
-        return np.sum(diffs**2)
+        return np.max(valid_diffs)
+    elif style == "l2":  # Default to l2 if style is not 'max'
+        return np.sum(valid_diffs**2)
+    else:  # Should not happen due to TestConfig validation, but safer
+        return np.sum(valid_diffs**2)
 
 
 def _calculate_gpd_pvalue(
@@ -439,22 +547,40 @@ def _calculate_gpd_pvalue(
         - gpd_fit: Dictionary with GPD parameters (xi, beta, threshold)
         - applied_gpd: Boolean indicating if GPD was applied
     """
-    threshold = np.quantile(T_null, threshold_quantile)
-
-    # If observed statistic isn't extreme, don't apply GPD
-    if T_obs <= threshold:
+    # Filter NaNs from null distribution before calculating quantile/threshold
+    T_null_valid = T_null[~np.isnan(T_null)]
+    if T_null_valid.size == 0:
+        warnings.warn("Null distribution contains only NaNs. Cannot apply GPD.")
+        # Return empirical based on original T_null which might also be all NaN
+        # Avoid division by zero if len(T_null) is 0
+        emp_p = np.nan if len(T_null) == 0 else np.mean(T_null >= T_obs)
         return {
-            "p_value_gpd": np.mean(T_null >= T_obs),
+            "p_value_gpd": emp_p,
             "gpd_fit": None,
             "applied_gpd": False,
         }
 
-    tail_data = T_null[T_null > threshold]
+    threshold = np.quantile(T_null_valid, threshold_quantile)
+
+    # If observed statistic isn't extreme, don't apply GPD
+    # Also handle case where T_obs might be NaN
+    if np.isnan(T_obs) or T_obs <= threshold:
+        # Calculate empirical p-value using original T_null to handle potential NaNs correctly
+        emp_p = np.nan if len(T_null) == 0 else np.mean(T_null >= T_obs)
+        return {
+            "p_value_gpd": emp_p,
+            "gpd_fit": None,
+            "applied_gpd": False,
+        }
+
+    tail_data = T_null_valid[T_null_valid > threshold]
 
     # Check if we have enough tail points for stable fitting
-    if tail_data.size < 30:
+    min_tail_points = 30  # Minimum number of points for reliable GPD fit
+    if tail_data.size < min_tail_points:
+        emp_p = np.nan if len(T_null) == 0 else np.mean(T_null >= T_obs)
         return {
-            "p_value_gpd": np.mean(T_null >= T_obs),
+            "p_value_gpd": emp_p,
             "gpd_fit": None,
             "applied_gpd": False,
         }
@@ -462,24 +588,37 @@ def _calculate_gpd_pvalue(
     # Fit GPD to excesses
     excesses = tail_data - threshold
     try:
+        # floc=0 fixes the location parameter to 0 for excesses
         xi, _, beta = genpareto.fit(excesses, floc=0)
+
+        # Check for potentially unstable fit parameters
+        if beta <= 0:
+            raise ValueError("GPD fit resulted in non-positive scale (beta).")
+        # Consider adding checks for extreme xi values if needed
+
         excess_obs = T_obs - threshold
+        # Use survival function (sf = 1 - cdf) for P(X > x)
         tail_prob = genpareto.sf(excess_obs, c=xi, loc=0, scale=beta)
 
-        F_threshold = np.mean(T_null < threshold)
-        p_value_gpd = (1 - F_threshold) * tail_prob
+        # Proportion of data below threshold (using original T_null)
+        prop_below_threshold = np.mean(T_null < threshold)
+        p_value_gpd = (1 - prop_below_threshold) * tail_prob
+
+        # Ensure p-value is valid
+        p_value_gpd = np.clip(p_value_gpd, 0.0, 1.0)
 
         return {
             "p_value_gpd": p_value_gpd,
             "gpd_fit": GPDFit(xi=xi, beta=beta, threshold=threshold),
             "applied_gpd": True,
         }
-    except (RuntimeError, ValueError) as e:
+    except (RuntimeError, ValueError, FloatingPointError) as e:
         warnings.warn(
             f"GPD fitting failed: {str(e)}. Using empirical p-value instead."
         )
+        emp_p = np.nan if len(T_null) == 0 else np.mean(T_null >= T_obs)
         return {
-            "p_value_gpd": np.mean(T_null >= T_obs),
+            "p_value_gpd": emp_p,
             "gpd_fit": None,
             "applied_gpd": False,
         }
@@ -490,7 +629,7 @@ def _generate_null_distribution(
     aggregator_style: str,
 ) -> np.ndarray:
     """
-    Generate null distribution of test statistics.
+    Generate null distribution of test statistics using leave-one-out means.
 
     Parameters
     ----------
@@ -502,16 +641,47 @@ def _generate_null_distribution(
     Returns
     -------
     T_null : numpy.ndarray
-        Array of test statistics from null distribution.
+        Array of test statistics from null distribution. Shape (n_permutations,).
+        May contain NaNs if input columns are all NaN.
     """
-    B = null_matrix.shape[1]
-    colsums = np.sum(null_matrix, axis=1)
-    T_null = np.empty(B)
+    n_depths, B = null_matrix.shape
+    if B <= 1:
+        warnings.warn(
+            "Cannot generate null distribution with <= 1 permutation."
+        )
+        return np.full(B, np.nan)
+
+    # Calculate sum across permutations for each depth, ignoring NaNs
+    colsums = np.nansum(null_matrix, axis=1)
+    # Count non-NaN values for each depth
+    valid_counts = np.sum(~np.isnan(null_matrix), axis=1)
+
+    T_null = np.full(B, np.nan)  # Initialize with NaN
 
     for i in range(B):
-        loo_mean = (colsums - null_matrix[:, i]) / (B - 1)
-        diffs = np.abs(null_matrix[:, i] - loo_mean)
-        T_null[i] = _aggregator(diffs, aggregator_style)
+        current_col = null_matrix[:, i]
+        # Skip if current column is all NaN
+        if np.all(np.isnan(current_col)):
+            continue
+
+        # Calculate leave-one-out sum and count
+        loo_sum = colsums - np.nan_to_num(
+            current_col
+        )  # Treat NaN in current_col as 0 for subtraction
+        loo_count = valid_counts - (~np.isnan(current_col)).astype(int)
+
+        # Calculate leave-one-out mean, avoiding division by zero
+        loo_mean = np.full(n_depths, np.nan)
+        valid_mask = loo_count > 0
+        loo_mean[valid_mask] = loo_sum[valid_mask] / loo_count[valid_mask]
+
+        # Calculate difference, ignoring NaNs in either current_col or loo_mean
+        diffs = np.abs(current_col - loo_mean)  # NaNs will propagate
+
+        # Aggregate valid differences
+        T_null[i] = _aggregator(
+            diffs, aggregator_style
+        )  # _aggregator handles NaNs
 
     return T_null
 
@@ -519,6 +689,16 @@ def _generate_null_distribution(
 ###################
 # Core Algorithms
 ###################
+
+
+def _nanmad(x: np.ndarray) -> float:
+    """Calculate Median Absolute Deviation, ignoring NaNs."""
+    x_valid = x[~np.isnan(x)]
+    if len(x_valid) == 0:
+        return np.nan
+    med = np.median(x_valid)
+    # Scale factor 1.4826 assumes normality for consistency
+    return np.median(np.abs(x_valid - med)) * 1.4826
 
 
 def compute_sra(
@@ -529,106 +709,249 @@ def compute_sra(
 
     This is the pure functional core of the SRA algorithm. It handles the case
     of incomplete lists by imputing missing values through random resampling.
+    It uses a robust method to reshape ranks for calculation.
 
     Parameters
     ----------
     ranked_lists : numpy.ndarray
-        Array of shape (n_lists, list_length) where each row is a ranked list.
+        Array of shape (n_lists, list_length) where each row is a ranked list
+        containing numeric item IDs (assumed 1-based).
     config : SRAConfig
         Configuration for SRA computation.
     nitems : int, optional
-        Total number of items. If None, inferred from ranked_lists.
+        Total number of items in the universe (determines the max item ID, assumed 1 to nitems).
+        If None, inferred as max(ranked_lists) if possible, otherwise from list_length.
+        Crucial for correct imputation and sizing of `when_included`.
 
     Returns
     -------
     result : SRAResult
         Container for SRA computation results.
     """
-    ranked_lists = np.array(ranked_lists, dtype=float)
+    # Validate and prepare input data
+    if not isinstance(ranked_lists, np.ndarray):
+        ranked_lists = np.array(ranked_lists)
+    if not np.issubdtype(ranked_lists.dtype, np.number):
+        raise ValueError("Input ranked_lists must be numeric.")
+
+    ranked_lists = ranked_lists.astype(float)  # Work with floats internally
     num_lists, list_length = ranked_lists.shape
 
+    # Determine nitems (total universe size)
+    original_nitems = nitems
     if nitems is None:
-        nitems = list_length
-    elif list_length < nitems:
-        # Pad with missing values
+        # Infer nitems cautiously
+        present_ids = ranked_lists[~np.isnan(ranked_lists)]
+        if present_ids.size > 0:
+            max_id = int(np.nanmax(present_ids))
+            # Use max ID found, or list_length if max ID is smaller (less likely)
+            nitems = max(max_id, list_length)
+            if nitems > list_length and original_nitems is None:
+                warnings.warn(
+                    f"Inferred nitems={nitems} from max item ID found, "
+                    f"which is greater than list_length={list_length}. Ensure this is intended."
+                )
+        else:
+            nitems = list_length  # Fallback if all NaNs or empty
+        if nitems == 0:
+            raise ValueError("Cannot compute SRA with nitems=0.")
+    elif not isinstance(nitems, int) or nitems <= 0:
+        raise ValueError("nitems must be a positive integer.")
+
+    if list_length < nitems:
+        # Pad with missing values (NaN) if list_length is smaller than universe size
         pad_width = nitems - list_length
         pad = np.full((num_lists, pad_width), np.nan)
         ranked_lists = np.concatenate([ranked_lists, pad], axis=1)
+        list_length = nitems  # Update list_length to reflect padding
+    elif list_length > nitems:
+        # Truncate lists if they are longer than the specified universe size
+        warnings.warn(
+            f"Input list_length ({list_length}) > specified nitems ({nitems}). Truncating lists."
+        )
+        ranked_lists = ranked_lists[:, :nitems]
+        list_length = nitems
 
-    if np.isscalar(config.epsilon):
+    # Prepare epsilon array
+    if isinstance(config.epsilon, (int, float)):
         epsilons = np.full(nitems, float(config.epsilon))
     else:
+        # Ensure numpy array and correct type
         epsilons = np.asarray(config.epsilon, dtype=float)
-        if len(epsilons) != nitems:
+        if epsilons.ndim == 0:  # Handle scalar array
+            epsilons = np.full(nitems, float(epsilons))
+        elif epsilons.shape != (nitems,):
             raise ValueError(
-                f"Length of epsilon ({len(epsilons)}) must match nitems ({nitems})"
+                f"Length of epsilon array ({len(epsilons)}) must match nitems ({nitems})"
             )
 
     # Store SRA curves from each resample
-    sra_curves = np.zeros((config.B, nitems))
+    sra_curves = np.full((config.B, nitems), np.nan)  # Initialize with NaN
+    # Initialize when_included for the first bootstrap run (b=0)
+    # Use nitems + 1 as initial value, convert to inf later
     when_included = np.full(nitems, nitems + 1, dtype=float)
+    id_to_index_map_bs0 = None  # Store map from first bootstrap
 
     # For each resample, impute missing values and compute the SRA curve
+    all_items_set = set(range(1, nitems + 1))  # Universe of item IDs
+
     for b in range(config.B):
         imputed = np.empty_like(ranked_lists)
+
         for i in range(num_lists):
             list_i = ranked_lists[i, :]
             observed_mask = ~np.isnan(list_i)
-            observed = list_i[observed_mask].astype(int)
-            missing_idx = np.where(~observed_mask)[0]
+            observed = list_i[observed_mask]
 
-            all_items = set(range(1, nitems + 1))
-            observed_set = set(observed)
-            missing_items = np.array(list(all_items - observed_set), dtype=int)
+            # Ensure observed IDs are integers for set operations
+            if observed.size > 0:
+                # Check for non-integer values that might cause issues
+                if not np.all(np.isclose(observed, np.round(observed))):
+                    warnings.warn(
+                        f"List {i} contains non-integer item IDs. Casting to int."
+                    )
+                observed_int = observed.astype(int)
+                # Validate IDs are within expected range [1, nitems]
+                if np.any(observed_int < 1) or np.any(observed_int > nitems):
+                    invalid_ids = observed_int[
+                        (observed_int < 1) | (observed_int > nitems)
+                    ]
+                    raise ValueError(
+                        f"List {i} contains invalid item ID(s) (e.g., {invalid_ids[0]}) "
+                        f"outside the expected range [1, {nitems}]."
+                    )
+                observed_set = set(observed_int)
+            else:
+                observed_set = set()
+
+            missing_idx = np.where(~observed_mask)[0]
+            missing_items = np.array(
+                list(all_items_set - observed_set), dtype=int
+            )
 
             if missing_items.size > 0:
                 np.random.shuffle(missing_items)
 
             new_list = list_i.copy()
-            for j, idx in enumerate(missing_idx):
-                if j < len(missing_items):
-                    new_list[idx] = missing_items[j]
+            # Impute missing values
+            num_to_impute = min(len(missing_idx), len(missing_items))
+            if num_to_impute < len(missing_idx):
+                warnings.warn(
+                    f"List {i}, Resample {b}: More missing slots ({len(missing_idx)}) "
+                    f"than available unique items to impute ({len(missing_items)}). "
+                    f"Leaving {len(missing_idx) - num_to_impute} slots as NaN."
+                )
 
+            imputed_indices = missing_idx[:num_to_impute]
+            new_list[imputed_indices] = missing_items[:num_to_impute]
             imputed[i, :] = new_list
 
-        rank_mat = _reshape_rank_matrix(imputed)
-
-        if config.metric.lower() == "sd":
-            disagreements = np.var(rank_mat, axis=0, ddof=1)
-        elif config.metric.lower() == "mad":
-
-            def mad(x):
-                med = np.median(x)
-                return np.median(np.abs(x - med)) * 1.4826
-
-            disagreements = np.array(
-                [mad(rank_mat[:, j]) for j in range(nitems)]
-            )
-        else:
-            raise ValueError(f"Unsupported metric: {config.metric}")
-
-        sra_curve = np.zeros(nitems)
-        for d in range(1, nitems + 1):
-            prop = np.mean(rank_mat <= d, axis=0)
-            depth_set = prop > epsilons[d - 1]
+        # Use the robust reshaping function
+        try:
+            rank_mat, id_to_index_map = _reshape_to_item_cols(imputed)
             if b == 0:
-                for j in range(nitems):
-                    if depth_set[j] and d < when_included[j]:
-                        when_included[j] = d
+                id_to_index_map_bs0 = id_to_index_map  # Save for when_included
+        except ValueError as e:
+            raise ValueError(
+                f"Error during rank matrix reshaping in bootstrap {b}: {e}"
+            )
 
-            if np.any(depth_set):
-                sra_curve[d - 1] = np.mean(disagreements[depth_set])
+        # rank_mat shape: (num_lists, num_unique_items_found)
+        # Values are ranks (1-based), NaNs indicate absence.
+
+        # Calculate disagreements per item (across lists)
+        if config.metric.lower() == "sd":
+            # np.nanvar ignores NaNs, ddof=1 for sample variance
+            disagreements = np.nanvar(rank_mat, axis=0, ddof=1)
+        elif config.metric.lower() == "mad":
+            # Apply nanmad across lists (axis 0) for each item (column)
+            disagreements = np.apply_along_axis(_nanmad, 0, rank_mat)
+            # Replace NaNs (e.g., item never appeared) with 0 disagreement? Or keep NaN?
+            # Keeping NaN seems safer, let downstream handle it.
+            # disagreements = np.nan_to_num(disagreements, nan=0.0) # Old: filled with 0
+        else:
+            # This case should be caught by SRAConfig validation
+            raise ValueError(
+                f"Unsupported metric: {config.metric}"
+            )  # Should not happen
+
+        # disagreements shape: (num_unique_items_found,)
+
+        sra_curve_b = np.full(
+            nitems, np.nan
+        )  # Initialize curve for this bootstrap run
+
+        if b == 0 and id_to_index_map_bs0 is None:
+            # Handle case where reshaping failed or returned no map on first run
+            warnings.warn(
+                "Could not obtain item ID map on first bootstrap; 'when_included' will not be calculated."
+            )
+
+        # Build inverse map for when_included (only need to do once)
+        index_to_id_map_bs0 = (
+            {v: k for k, v in id_to_index_map_bs0.items()}
+            if id_to_index_map_bs0
+            else {}
+        )
+
+        for d in range(1, nitems + 1):  # Iterate through depths 1 to nitems
+            # Proportion of lists where item rank is <= d
+            # rank_mat contains ranks (1-based) or NaN
+            prop = np.nanmean(
+                (rank_mat <= d).astype(float), axis=0
+            )  # nanmean ignores NaNs
+
+            current_epsilon = epsilons[d - 1]
+
+            # Indices of items (columns in rank_mat) satisfying the condition
+            depth_set_indices = np.where(prop > current_epsilon)[0]
+
+            # Update when_included based on the first bootstrap run (b=0)
+            if b == 0 and len(index_to_id_map_bs0) > 0:
+                for item_col_idx in depth_set_indices:
+                    # Map column index back to original item ID
+                    original_item_id = index_to_id_map_bs0.get(item_col_idx)
+                    if original_item_id is not None:
+                        # Convert 1-based item ID to 0-based index for when_included
+                        when_included_idx = int(original_item_id) - 1
+                        # Check bounds just in case
+                        if 0 <= when_included_idx < nitems:
+                            if d < when_included[when_included_idx]:
+                                when_included[when_included_idx] = d
+
+            # Calculate SRA value for depth d
+            if depth_set_indices.size > 0:
+                # Get disagreements for items in the current depth set
+                # disagreements array corresponds to rank_mat columns
+                disagreements_at_depth = disagreements[depth_set_indices]
+                # Calculate mean, ignoring potential NaNs in disagreements
+                mean_disagreement_at_depth = np.nanmean(disagreements_at_depth)
+                # If all disagreements were NaN, nanmean returns NaN. Handle this?
+                sra_curve_b[d - 1] = np.nan_to_num(
+                    mean_disagreement_at_depth, nan=0.0
+                )  # Fill NaN result with 0
             else:
-                sra_curve[d - 1] = 0.0
+                sra_curve_b[d - 1] = 0.0  # No items in set, 0 disagreement
 
-        sra_curves[b, :] = sra_curve
+        sra_curves[b, :] = sra_curve_b
 
-    avg_sra = np.mean(sra_curves, axis=0)
+    # Average SRA curves across bootstrap runs, ignoring NaNs
+    avg_sra = np.nanmean(sra_curves, axis=0)
 
+    # If metric is sd, take sqrt. Handle NaNs safely.
     if config.metric.lower() == "sd":
-        avg_sra = np.sqrt(avg_sra)
+        # Avoid RuntimeWarning for sqrt(NaN) and sqrt(negative)
+        with np.errstate(invalid="ignore"):  # Suppress warning locally
+            avg_sra_sqrt = np.sqrt(
+                np.maximum(0, avg_sra)
+            )  # Use maximum(0,...) for tiny negatives
+        avg_sra = np.where(np.isnan(avg_sra), np.nan, avg_sra_sqrt)
 
+    # Finalize when_included: replace placeholder with inf
     when_included[when_included > nitems] = np.inf
+
+    # Fill any remaining NaNs in avg_sra with 0? Consistent with empty set case.
+    avg_sra = np.nan_to_num(avg_sra, nan=0.0)
 
     return SRAResult(values=avg_sra, config=config, when_included=when_included)
 
@@ -639,28 +962,69 @@ def random_list_sra(
     n_permutations: int = 100,
     nitems: Optional[int] = None,
 ) -> RandomListSRAResult:
-    ranked_lists = np.asarray(ranked_lists, dtype=float)
+    # Validate input type early
+    if not isinstance(ranked_lists, np.ndarray):
+        try:
+            ranked_lists = np.array(ranked_lists, dtype=float)
+        except ValueError:
+            raise TypeError(
+                "Input ranked_lists must be array-like and numeric."
+            )
+    elif not np.issubdtype(ranked_lists.dtype, np.number):
+        # Input is ndarray but not numeric
+        try:
+            ranked_lists = ranked_lists.astype(float)
+        except ValueError:
+            raise TypeError("Input ranked_lists NumPy array must be numeric.")
+
+    if ranked_lists.ndim != 2:
+        raise ValueError("Input ranked_lists must be 2D.")
+
     num_lists, list_length = ranked_lists.shape
 
-    # If needed, pad out to nitems
+    # Determine nitems
+    original_nitems = nitems
     if nitems is None:
-        nitems = list_length
-    elif list_length < nitems:
+        present_ids = ranked_lists[~np.isnan(ranked_lists)]
+        if present_ids.size > 0:
+            max_id = int(np.nanmax(present_ids))
+            nitems = max(max_id, list_length)
+            if nitems > list_length and original_nitems is None:
+                warnings.warn(
+                    f"Inferred nitems={nitems} from max item ID found, "
+                    f"which is greater than list_length={list_length}. Using this for permutations."
+                )
+        else:
+            nitems = list_length
+        if nitems == 0:
+            raise ValueError("Cannot generate null distribution with nitems=0.")
+    elif not isinstance(nitems, int) or nitems <= 0:
+        raise ValueError("nitems must be a positive integer.")
+
+    # Pad input if necessary BEFORE calculating non-missing counts
+    if list_length < nitems:
         pad_width = nitems - list_length
         pad = np.full((num_lists, pad_width), np.nan)
         ranked_lists = np.concatenate([ranked_lists, pad], axis=1)
-        list_length = ranked_lists.shape[1]
+        list_length = nitems  # Update list_length
+    elif list_length > nitems:
+        warnings.warn(
+            f"Input list_length ({list_length}) > specified nitems ({nitems}). Truncating lists for null generation."
+        )
+        ranked_lists = ranked_lists[:, :nitems]
+        list_length = nitems
 
-    # Count how many items are actually non-missing in each row
+    # Count how many items are actually non-missing in each row of the potentially padded/truncated array
     notmiss = np.sum(~np.isnan(ranked_lists), axis=1).astype(int)
 
     # Pre-generate random partial-permutations for each row
     sample_list = []
+    all_possible_ids = np.arange(1, nitems + 1)
     for nn in notmiss:
         # nn is how many items are actually observed
         # generate n_permutations permutations of [1..nitems], each truncated to length nn
         row_samples = [
-            np.random.permutation(nitems)[:nn] + 1
+            np.random.choice(all_possible_ids, size=nn, replace=False)
             for _ in range(n_permutations)
         ]
         sample_list.append(row_samples)
@@ -669,12 +1033,15 @@ def random_list_sra(
     sra_results = []
     for i in range(n_permutations):
         # For each replicate i, assemble a new matrix from row i's partial permutations
-        current_obj = np.full((num_lists, list_length), np.nan, dtype=float)
+        # Ensure the matrix has the full nitems columns for compute_sra
+        current_obj = np.full((num_lists, nitems), np.nan, dtype=float)
         for row_idx in range(num_lists):
             nn = notmiss[row_idx]
             if nn > 0:
+                # Place the sampled items into the first nn columns
                 current_obj[row_idx, :nn] = sample_list[row_idx][i]
-        # compute SRA on that entire matrix
+
+        # Compute SRA on that entire matrix, passing the consistent nitems
         sra_curve = compute_sra(current_obj, config, nitems).values
         sra_results.append(sra_curve)
 
@@ -696,9 +1063,9 @@ def test_sra(
     Parameters
     ----------
     observed_sra : numpy.ndarray
-        Observed SRA values.
+        Observed SRA values (1D array).
     null_distribution : numpy.ndarray
-        Null distribution of SRA values.
+        Null distribution of SRA values (2D array, shape n_depths x n_permutations).
     config : TestConfig
         Configuration for the test.
 
@@ -710,39 +1077,86 @@ def test_sra(
     observed_sra = np.asarray(observed_sra)
     null_distribution = np.asarray(null_distribution)
 
-    # Apply smoothing if requested
-    if config.window > 1:
-        observed_sra = smooth_sra_window(observed_sra, config.window)
-        null_distribution = np.apply_along_axis(
-            lambda n: smooth_sra_window(n, config.window), 0, null_distribution
+    if observed_sra.ndim != 1:
+        raise ValueError("observed_sra must be 1D.")
+    if null_distribution.ndim != 2:
+        raise ValueError("null_distribution must be 2D.")
+    if observed_sra.shape[0] != null_distribution.shape[0]:
+        raise ValueError(
+            "observed_sra and null_distribution must have the same number of depths."
         )
 
-    # Compute test statistic
-    diffs_obs = np.abs(observed_sra - np.mean(null_distribution, axis=1))
-    T_obs = _aggregator(diffs_obs, style=config.style)
+    # Apply smoothing if requested
+    if config.window > 1:
+        observed_sra_smooth = smooth_sra_window(observed_sra, config.window)
+        # Apply smoothing to each column (permutation) of the null distribution
+        null_distribution_smooth = np.apply_along_axis(
+            lambda n: smooth_sra_window(n, config.window), 0, null_distribution
+        )
+    else:
+        observed_sra_smooth = observed_sra
+        null_distribution_smooth = null_distribution
+
+    # Compute test statistic for observed data
+    # Calculate mean of the null distribution *per depth*, ignoring NaNs
+    mean_null_sra = np.nanmean(null_distribution_smooth, axis=1)
+    diffs_obs = np.abs(
+        observed_sra_smooth - mean_null_sra
+    )  # NaNs may propagate if mean_null_sra is NaN
+    T_obs = _aggregator(
+        diffs_obs, style=config.style
+    )  # _aggregator handles NaNs in diffs_obs
 
     # Generate null distribution of test statistics
-    T_null = _generate_null_distribution(null_distribution, config.style)
+    T_null = _generate_null_distribution(null_distribution_smooth, config.style)
 
-    # Compute empirical p-value
-    p_value_empirical = (np.sum(T_null >= T_obs) + 1) / (len(T_null) + 1)
+    # Compute empirical p-value (handle potential NaNs in T_null)
+    # Compare T_obs with valid (non-NaN) values in T_null
+    valid_T_null = T_null[~np.isnan(T_null)]
+    if valid_T_null.size == 0:
+        # Handle case where null generation failed completely
+        p_value_empirical = np.nan
+        warnings.warn(
+            "Could not compute empirical p-value; null distribution generation yielded only NaNs."
+        )
+    elif np.isnan(T_obs):
+        p_value_empirical = np.nan
+        warnings.warn(
+            "Could not compute empirical p-value; observed test statistic is NaN."
+        )
+    else:
+        # Count how many null stats are >= observed stat
+        # Add 1 to numerator and denominator for adjusted p-value
+        p_value_empirical = (np.sum(valid_T_null >= T_obs) + 1) / (
+            len(valid_T_null) + 1
+        )
 
     # Use GPD if requested
     gpd_results = None
     p_value_gpd = None
     gpd_fit = None
 
-    if config.use_gpd:
+    # Only apply GPD if empirical p-value and T_obs are valid
+    if (
+        config.use_gpd
+        and not np.isnan(p_value_empirical)
+        and not np.isnan(T_obs)
+        and valid_T_null.size > 0
+    ):
+        # Pass only valid T_null values to GPD calculation
         gpd_results = _calculate_gpd_pvalue(
-            T_obs, T_null, config.threshold_quantile
+            T_obs, valid_T_null, config.threshold_quantile
         )
         p_value_gpd = gpd_results["p_value_gpd"]
         gpd_fit = gpd_results["gpd_fit"]
+        # If GPD failed and returned empirical, set p_value_gpd to None?
+        # Let's keep the potentially empirical value returned by _calculate_gpd_pvalue
+        # It handles internal failures gracefully.
 
     return TestResult(
         p_value_empirical=p_value_empirical,
         test_statistic=T_obs,
-        null_statistics=T_null,
+        null_statistics=T_null,  # Return original T_null including potential NaNs
         config=config,
         p_value_gpd=p_value_gpd,
         gpd_fit=gpd_fit,
@@ -757,20 +1171,20 @@ def compare_sra(
     config: TestConfig,
 ) -> ComparisonResult:
     """
-    Compare two SRA curves.
+    Compare two SRA curves based on their deviation from their respective nulls.
 
     Parameters
     ----------
     sra1 : numpy.ndarray
-        First SRA curve.
+        First SRA curve (1D array).
     sra2 : numpy.ndarray
-        Second SRA curve.
+        Second SRA curve (1D array).
     null1 : numpy.ndarray
-        Null distribution for first curve.
+        Null distribution for first curve (2D array).
     null2 : numpy.ndarray
-        Null distribution for second curve.
+        Null distribution for second curve (2D array).
     config : TestConfig
-        Configuration for the test.
+        Configuration for the test (style, window).
 
     Returns
     -------
@@ -782,48 +1196,126 @@ def compare_sra(
     null1 = np.asarray(null1)
     null2 = np.asarray(null2)
 
+    # Basic validation
+    if sra1.ndim != 1 or sra2.ndim != 1:
+        raise ValueError("SRA curves must be 1D arrays.")
+    if null1.ndim != 2 or null2.ndim != 2:
+        raise ValueError("Null distributions must be 2D arrays.")
+    if (
+        sra1.shape[0] != sra2.shape[0]
+        or sra1.shape[0] != null1.shape[0]
+        or sra1.shape[0] != null2.shape[0]
+    ):
+        raise ValueError(
+            "All inputs must have the same number of depths (first dimension)."
+        )
+    if null1.shape[1] == 0 or null2.shape[1] == 0:
+        raise ValueError("Null distributions cannot have zero permutations.")
+
     # Apply smoothing if requested
     if config.window > 1:
-        sra1 = smooth_sra_window(sra1, config.window)
-        sra2 = smooth_sra_window(sra2, config.window)
-        null1 = np.apply_along_axis(
+        sra1_smooth = smooth_sra_window(sra1, config.window)
+        sra2_smooth = smooth_sra_window(sra2, config.window)
+        null1_smooth = np.apply_along_axis(
             lambda n: smooth_sra_window(n, config.window), 0, null1
         )
-        null2 = np.apply_along_axis(
+        null2_smooth = np.apply_along_axis(
             lambda n: smooth_sra_window(n, config.window), 0, null2
         )
+    else:
+        sra1_smooth = sra1
+        sra2_smooth = sra2
+        null1_smooth = null1
+        null2_smooth = null2
 
-    # Compute test statistics for each curve
-    T_obs1 = _aggregator(np.abs(sra1 - np.mean(null1, axis=1)), config.style)
-    T_obs2 = _aggregator(np.abs(sra2 - np.mean(null2, axis=1)), config.style)
+    # Compute test statistics for each observed curve relative to its null mean
+    mean_null1 = np.nanmean(null1_smooth, axis=1)
+    mean_null2 = np.nanmean(null2_smooth, axis=1)
 
-    # Compute observed difference
-    T_obs = T_obs1 - T_obs2
+    diffs_obs1 = np.abs(sra1_smooth - mean_null1)
+    diffs_obs2 = np.abs(sra2_smooth - mean_null2)
 
-    # Generate null distribution by comparing random permutations
-    combined = np.hstack([null1, null2])
-    B = combined.shape[1]
-    T_null = np.empty(B)
+    T_obs1 = _aggregator(diffs_obs1, config.style)
+    T_obs2 = _aggregator(diffs_obs2, config.style)
 
-    for i in range(B):
-        cols = np.random.choice(B, size=2, replace=False)
-        T1 = _aggregator(
-            np.abs(combined[:, cols[0]] - np.mean(combined, axis=1)),
-            config.style,
+    # Observed difference in test statistics
+    T_obs = (
+        T_obs1 - T_obs2
+    )  # Or abs(T_obs1 - T_obs2)? Original uses subtraction.
+
+    # Generate null distribution of the *difference* in test statistics
+    # Combine null distributions
+    combined_null = np.hstack([null1_smooth, null2_smooth])
+    B_total = combined_null.shape[1]
+    B1 = null1_smooth.shape[1]
+    # B2 = null2_smooth.shape[1] # B_total = B1 + B2
+
+    # We need to simulate drawing one curve from null1 and one from null2 many times.
+    # A simpler approach (used in original paper?) is to compute stats for ALL null curves
+    # relative to the COMBINED null mean, then compare distributions. Let's try that.
+
+    mean_combined_null = np.nanmean(combined_null, axis=1)
+
+    # Calculate test stat for every column in the combined null distribution
+    T_null_all = np.full(B_total, np.nan)
+    for i in range(B_total):
+        diffs_null_i = np.abs(combined_null[:, i] - mean_combined_null)
+        T_null_all[i] = _aggregator(diffs_null_i, config.style)
+
+    # Separate the calculated statistics back into original groups
+    T_null_group1 = T_null_all[:B1]
+    T_null_group2 = T_null_all[B1:]
+
+    # Filter NaNs within each group
+    T_null_group1_valid = T_null_group1[~np.isnan(T_null_group1)]
+    T_null_group2_valid = T_null_group2[~np.isnan(T_null_group2)]
+
+    # Check if we have enough valid stats in both groups
+    if T_null_group1_valid.size == 0 or T_null_group2_valid.size == 0:
+        warnings.warn(
+            "Could not compute comparison p-value; one or both null groups lack valid test statistics."
         )
-        T2 = _aggregator(
-            np.abs(combined[:, cols[1]] - np.mean(combined, axis=1)),
-            config.style,
+        p_value = np.nan
+        T_null_diff_dist = np.array([np.nan])  # Placeholder
+    elif np.isnan(T_obs):
+        p_value = np.nan
+        T_null_diff_dist = np.array([np.nan])
+        warnings.warn(
+            "Could not compute comparison p-value; observed test statistic difference is NaN."
         )
-        T_null[i] = T1 - T2
+    else:
+        # Generate null distribution of the difference by sampling permutations
+        # To maintain independence, sample with replacement if B1 != B2? Or just use all pairs?
+        # Let's use permutation approach: calculate diff for all pairs formed by shuffling labels.
+        # A simpler approximation: difference between the two distributions of T_null stats.
+        # Use random pairing (assuming large enough B1, B2)
+        n_samples = min(len(T_null_group1_valid), len(T_null_group2_valid))
+        if n_samples == 0:  # Should be caught above, but defensive check
+            p_value = np.nan
+            T_null_diff_dist = np.array([np.nan])
+        else:
+            # Sample indices without replacement for pairing
+            idx1 = np.random.choice(
+                len(T_null_group1_valid), n_samples, replace=False
+            )
+            idx2 = np.random.choice(
+                len(T_null_group2_valid), n_samples, replace=False
+            )
+            T_null_diff_dist = (
+                T_null_group1_valid[idx1] - T_null_group2_valid[idx2]
+            )
 
-    # Compute p-value
-    p_value = (np.sum(T_null >= T_obs) + 1) / (B + 1)
+            # Compute two-sided p-value? Original seems one-sided (T_null >= T_obs)
+            # Let's stick to one-sided based on T_obs = T_obs1 - T_obs2
+            p_value = (np.sum(T_null_diff_dist >= T_obs) + 1) / (
+                len(T_null_diff_dist) + 1
+            )
 
     return ComparisonResult(
         p_value=p_value,
         test_statistic=T_obs,
-        null_statistics=T_null,
+        # Return the distribution of differences used for p-value calculation
+        null_statistics=T_null_diff_dist,
         config=config,
     )
 
@@ -837,51 +1329,13 @@ class RankData:
     """Utility for handling and transforming ranked data."""
 
     @staticmethod
-    def from_items(items_lists: list[list[Any]]) -> np.ndarray:
-        """Convert lists of items to numeric ranks.
-
-        Parameters
-        ----------
-        items_lists : list of lists
-            Each inner list contains items in their ranked order.
-
-        Returns
-        -------
-        rank_matrix : numpy.ndarray
-            Array of shape (len(items_lists), max_items) where each row
-            is a ranked list converted to numeric ranks.
-        """
-        result = []
-
-        # Find unique items across all lists
-        all_items = set()
-        for items in items_lists:
-            all_items.update(items)
-
-        # Create a mapping from items to integer IDs
-        item_to_id = {
-            item: idx + 1 for idx, item in enumerate(sorted(all_items))
-        }
-
-        # Convert each list to numeric IDs
-        for items in items_lists:
-            result.append([item_to_id[item] for item in items])
-
-        # Find maximum length and pad with NaN
-        max_len = max(len(lst) for lst in result)
-        padded_result = []
-
-        for lst in result:
-            padded = lst + [np.nan] * (max_len - len(lst))
-            padded_result.append(padded)
-
-        return np.array(padded_result)
-
-    @staticmethod
     def from_scores(
         scores: list[list[float]], ascending: bool = True
     ) -> np.ndarray:
         """Convert lists of scores to ranks (e.g., p-values, correlations).
+
+        Produces a LISTROW_ITEMCOL like array where columns implicitly represent items
+        based on original position, and values are ranks.
 
         Parameters
         ----------
@@ -894,31 +1348,335 @@ class RankData:
         Returns
         -------
         rank_matrix : numpy.ndarray
-            Array where each row contains the corresponding ranks.
+            Array where each row contains the corresponding ranks (1-based).
+            Shape (n_lists, n_items). NaNs are preserved.
         """
         result = []
+        max_len = 0
 
+        # First pass to find max length
         for score_list in scores:
-            # Convert to numpy array
-            scores_array = np.array(score_list)
+            max_len = max(max_len, len(score_list))
 
-            # Handle NaN values
-            mask = ~np.isnan(scores_array)
-            valid_scores = scores_array[mask]
+        if max_len == 0:
+            return np.empty((len(scores), 0), dtype=float)
 
-            # Get ranks (argsort of argsort gives ranks)
-            if ascending:
-                valid_ranks = np.argsort(np.argsort(valid_scores)) + 1
+        # Second pass to compute ranks and pad
+        for score_list in scores:
+            scores_array = np.array(score_list, dtype=float)
+            # Pad if necessary before ranking
+            if len(scores_array) < max_len:
+                padded_scores = np.pad(
+                    scores_array,
+                    (0, max_len - len(scores_array)),
+                    mode="constant",
+                    constant_values=np.nan,
+                )
             else:
-                valid_ranks = np.argsort(np.argsort(-valid_scores)) + 1
+                padded_scores = scores_array
 
-            # Create full array with NaN for missing values
-            ranks = np.full_like(scores_array, np.nan)
+            mask = ~np.isnan(padded_scores)
+            valid_scores = padded_scores[mask]
+
+            # Get ranks (argsort of argsort gives ranks, 0-based)
+            if valid_scores.size > 0:
+                if ascending:
+                    # Use scipy.stats.rankdata for better tie handling ('average', 'min', etc.)
+                    # Using 'ordinal' breaks ties by order of appearance, giving unique ranks 1..N
+                    valid_ranks = rankdata(
+                        valid_scores, method="ordinal"
+                    )  # Gives 1-based ranks
+                else:
+                    valid_ranks = rankdata(
+                        -valid_scores, method="ordinal"
+                    )  # Gives 1-based ranks
+            else:
+                valid_ranks = np.array([])
+
+            ranks = np.full(max_len, np.nan)  # Initialize with NaN
             ranks[mask] = valid_ranks
-
             result.append(ranks)
 
         return np.array(result)
+
+    @staticmethod
+    def from_items(
+        items_lists: list[list[Any]] | np.ndarray,
+        na_strings: Optional[list[str]] = None,
+    ) -> tuple[np.ndarray, dict]:
+        """Convert lists of items or numpy array of items to numeric ranks (LISTROW_RANKCOL).
+
+        Assigns dense, 1-based numeric IDs to unique items found. Items that are
+        not sortable or hashable (like dicts) will be converted to strings for mapping.
+
+        Parameters
+        ----------
+        items_lists : list of lists or numpy.ndarray
+            Either a list of lists where each inner list contains items in their ranked order,
+            or a numpy array of items (often strings) with possible NA values.
+        na_strings : Optional[list[str]], default=["", "nan", "na", "null", "none"]
+            Case-insensitive strings to interpret as NA/missing values. Applied to both
+            list and array inputs.
+
+        Returns
+        -------
+        rank_matrix : numpy.ndarray
+            Array in LISTROW_RANKCOL format. Shape (n_lists, max_list_length).
+            Values are the assigned 1-based numeric IDs. NaNs represent missing items.
+        item_mapping : dict
+            Dictionary with 'item_to_id' (original item or its string rep -> 1-based int ID) and
+            'id_to_item' (1-based int ID -> original item or its string rep) mappings.
+        """
+        processed_lists = []
+        is_np_input = isinstance(items_lists, np.ndarray)
+
+        # Consistent NA handling setup
+        default_na = ["", "nan", "na", "null", "none"]
+        current_na_strings = (
+            na_strings if na_strings is not None else default_na
+        )
+        na_set_lower = set(s.lower() for s in current_na_strings)
+
+        max_len = 0
+
+        if is_np_input:
+            items_array = items_lists
+            current_max_len = (
+                items_array.shape[1] if items_array.ndim == 2 else 0
+            )
+
+            if (
+                items_array.ndim == 1 and items_array.size > 0
+            ):  # Handle 1D array as single list
+                items_array = items_array.reshape(1, -1)
+                current_max_len = items_array.shape[1]
+                is_np_input = False  # Treat as list of lists now
+                items_lists = (
+                    items_array.tolist()
+                )  # Convert for list processing loop
+
+            elif items_array.ndim != 2:
+                if items_array.size == 0:
+                    items_lists = []
+                    is_np_input = False
+                else:
+                    raise ValueError(
+                        "Input numpy array must be 2D or convertible to 1D->2D."
+                    )
+
+            if is_np_input:  # If it was originally 2D
+                max_len = current_max_len  # Use shape[1]
+                na_mask = np.zeros_like(items_array, dtype=bool)
+                na_mask |= pd.isna(items_array)
+
+                if (
+                    np.issubdtype(items_array.dtype, np.character)
+                    or items_array.dtype == object
+                ):
+                    try:
+                        items_str = items_array.astype(str)
+                        items_lower = np.char.lower(items_str)
+                        for indicator in na_set_lower:
+                            na_mask |= items_lower == indicator
+                        na_mask |= np.char.strip(items_str) == ""
+                    except (TypeError, ValueError):
+                        pass
+
+                for i in range(items_array.shape[0]):
+                    row_list = [
+                        items_array[i, j] if not na_mask[i, j] else None
+                        for j in range(items_array.shape[1])
+                    ]
+                    processed_lists.append(row_list)
+
+        if not is_np_input:  # Process list of lists (or converted 1D array)
+            if not isinstance(items_lists, list):
+                raise TypeError("Input must be list of lists or numpy array.")
+
+            temp_processed_lists = []
+            current_max_len = 0
+            for i, sublist_orig in enumerate(items_lists):
+                # Ensure sublist is actually a list or tuple before processing
+                if not isinstance(sublist_orig, (list, tuple)):
+                    try:
+                        sublist = list(sublist_orig)  # Attempt conversion
+                    except TypeError:
+                        raise TypeError(
+                            f"Inner element at index {i} is not list-like."
+                        )
+                else:
+                    sublist = sublist_orig
+
+                processed_row = []
+                current_max_len = max(current_max_len, len(sublist))
+                for item in sublist:
+                    if item is None or pd.isna(item):
+                        processed_row.append(None)
+                    elif isinstance(item, str):
+                        item_lower = item.lower()
+                        if item_lower in na_set_lower or item.strip() == "":
+                            processed_row.append(None)
+                        else:
+                            processed_row.append(item)  # Keep original case
+                    else:
+                        processed_row.append(item)
+                temp_processed_lists.append(processed_row)
+
+            processed_lists = temp_processed_lists
+            max_len = current_max_len
+
+        # Collect all non-None items from processed lists
+        all_items_collected = []
+        for items in processed_lists:
+            all_items_collected.extend(
+                [item for item in items if item is not None]
+            )
+
+        if not all_items_collected:
+            warnings.warn("No valid items found in input.")
+            return np.full((len(processed_lists), max_len), np.nan), {
+                "item_to_id": {},
+                "id_to_item": {},
+            }
+
+        unique_hashable = []
+        seen_hashable = set()
+        unique_unhashable = []
+
+        for item in all_items_collected:
+            # Use isinstance check which is generally safer than try-except hash()
+            if isinstance(item, collections.abc.Hashable):
+                if item not in seen_hashable:
+                    seen_hashable.add(item)
+                    unique_hashable.append(item)
+            else:  # Unhashable item
+                is_new = True
+                for existing_unhashable in unique_unhashable:
+                    try:
+                        # Use equality check (==)
+                        if item == existing_unhashable:
+                            is_new = False
+                            break
+                    except Exception:
+                        # If equality check fails, consider them different
+                        pass
+                if is_new:
+                    unique_unhashable.append(item)
+
+        # Combine the unique items found
+        unique_items_raw = unique_hashable + unique_unhashable
+
+        # Attempt to sort unique items for deterministic mapping
+        items_for_mapping = []
+        lookup_is_string = False
+        try:
+            # Sorting will likely fail if unique_unhashable is not empty
+            # or if mixed types exist in unique_hashable.
+            items_for_mapping = sorted(unique_items_raw)
+        except TypeError:
+            warnings.warn(
+                "Items are not naturally sortable (e.g., mixed types, unhashable items); "
+                "converting to string for deterministic ID assignment. "
+                "Different items with the same string representation will get the same ID."
+            )
+            # Fallback: Convert all to strings, ensure uniqueness *after* conversion, then sort strings
+            unique_items_str_dict = {}
+            for item in unique_items_raw:
+                str_repr = str(item)
+                if str_repr not in unique_items_str_dict:
+                    unique_items_str_dict[str_repr] = (
+                        str_repr  # Store string key -> string value
+                    )
+
+            items_for_mapping = sorted(
+                unique_items_str_dict.keys()
+            )  # Sort the unique strings
+            lookup_is_string = True
+
+        # Assign dense 1-based IDs
+        item_to_id = {
+            item: id_val for id_val, item in enumerate(items_for_mapping, 1)
+        }
+        # Note: Keys in item_to_id are either original items or strings.
+        # Values in id_to_item are also either original items or strings, matching keys.
+        id_to_item = {id_val: item for item, id_val in item_to_id.items()}
+        item_mapping = {"item_to_id": item_to_id, "id_to_item": id_to_item}
+
+        # Convert each list to numeric IDs, preserving NA pattern (None -> np.nan)
+        result_numeric = np.full(
+            (len(processed_lists), max_len), np.nan, dtype=float
+        )
+        for i, items in enumerate(processed_lists):
+            # Pad the list with None if it's shorter than max_len
+            padded_items = items + [None] * (max_len - len(items))
+            for j, item in enumerate(padded_items):
+                if item is not None:
+                    # Determine the key for lookup based on whether strings were used
+                    lookup_key = str(item) if lookup_is_string else item
+                    item_id = item_to_id.get(lookup_key)
+                    if item_id is not None:
+                        result_numeric[i, j] = item_id
+                    # else: Item maps to None or key wasn't found (shouldn't happen if logic is correct)
+
+        # Validation (optional, requires adapter module)
+        try:
+            _validate_rankcol_no_midrow_nulls(result_numeric)
+            _validate_rankcol_no_duplicates(result_numeric)
+        except NameError:  # Functions not found
+            pass  # Ignore validation if not available
+        except ImportError:  # Module not found
+            pass
+        except ValueError as e:
+            warnings.warn(
+                f"Internal validation failed after creating rank matrix: {e}"
+            )
+
+        return result_numeric, item_mapping
+
+    @staticmethod
+    def map_ids_to_items(
+        id_array: np.ndarray, item_mapping: dict
+    ) -> np.ndarray:
+        """Convert array of numeric IDs back to original items (or their string reps).
+
+        Parameters
+        ----------
+        id_array : numpy.ndarray
+            Array containing numeric IDs (typically 1-based).
+        item_mapping : dict
+            Mapping dict returned by from_items method, containing 'id_to_item'.
+
+        Returns
+        -------
+        item_array : numpy.ndarray
+            Array with the same shape as id_array but with original items
+            (or string reps if string conversion occurred) instead of IDs.
+            NaNs and unmapped IDs result in None.
+        """
+        id_to_item = item_mapping.get("id_to_item")
+        if id_to_item is None:
+            raise ValueError(
+                "Invalid item_mapping provided; missing 'id_to_item'."
+            )
+
+        # Create array of object dtype to hold items of any type
+        result = np.full(id_array.shape, None, dtype=object)
+
+        # Iterate and map IDs back to items
+        for idx, val in np.ndenumerate(id_array):
+            if not pd.isna(val):
+                try:
+                    item_id_int = int(val)
+                    # Get original item or its string representation from the map
+                    original_item_or_rep = id_to_item.get(item_id_int)
+                    result[idx] = (
+                        original_item_or_rep  # This is None if ID not found
+                    )
+                except (ValueError, TypeError):
+                    result[idx] = None  # Treat non-int IDs as unmapped
+            # else: Leave as None for NaNs
+
+        return result
 
 
 class SRA(BaseEstimator):
@@ -953,16 +1711,20 @@ class SRA(BaseEstimator):
         Parameters
         ----------
         X : array-like of shape (n_lists, list_length)
-            Ranked lists data. Each row represents a list.
+            Ranked lists data containing numeric item IDs (assumed 1-based).
+            Use RankData.from_items() or RankData.from_scores() first
+            if starting from item names or scores.
         nitems : int, optional
-            Total number of items. If None, inferred from X.
+            Total number of items in the universe (max item ID). If None,
+            inferred inside compute_sra. Providing it is recommended for clarity
+            and consistency, especially if lists are truncated or padded.
 
         Returns
         -------
         self : object
             Fitted estimator.
         """
-        X = self._validate_input(X)
+        X = self._validate_input(X)  # Ensures X is 2D numeric array
         self.result_ = compute_sra(X, self.config, nitems)
         self.fitted_ = True
         return self
@@ -970,17 +1732,26 @@ class SRA(BaseEstimator):
     @require_generated
     def get_result(self) -> SRAResult:
         """Get the SRA computation result."""
+        if self.result_ is None:
+            # This should be caught by @require_generated, but defensive check
+            raise ValueError("SRA result not available. Call 'generate' first.")
         return self.result_
 
     @require_generated
     def values(self) -> np.ndarray:
         """Get the SRA values."""
-        return self.result_.values
+        return self.get_result().values
 
     @require_generated
-    def when_included(self) -> np.ndarray:
-        """Get the depth at which each item was first included."""
-        return self.result_.when_included
+    def when_included(self) -> Optional[np.ndarray]:
+        """Get the depth at which each item was first included (or np.inf)."""
+        # Check if when_included was successfully computed
+        res = self.get_result()
+        if res.when_included is None:
+            warnings.warn(
+                "'when_included' data is not available for this result."
+            )
+        return res.when_included
 
     @require_generated
     def smooth(self, window_size: int = 10) -> np.ndarray:
@@ -997,7 +1768,7 @@ class SRA(BaseEstimator):
         smoothed_values : ndarray
             Smoothed SRA curve.
         """
-        return self.result_.smooth(window_size)
+        return self.get_result().smooth(window_size)
 
 
 class RandomListSRA(BaseEstimator):
@@ -1006,15 +1777,13 @@ class RandomListSRA(BaseEstimator):
     Parameters
     ----------
     epsilon : float or array-like, default=0.0
-        Threshold for an item to be included in S(d).
+        Threshold for an item to be included in S(d). Passed to compute_sra.
     metric : {'sd', 'mad'}, default='sd'
-        Method to measure dispersion of ranks.
+        Method to measure dispersion of ranks. Passed to compute_sra.
     B : int, default=1
-        Number of bootstrap samples for handling missing values.
+        Number of bootstrap samples for handling missing values. Passed to compute_sra.
     n_permutations : int, default=100
         Number of permutations to generate.
-    n_jobs : int, default=1
-        Number of jobs for parallel processing. Use -1 to use all available cores.
     """
 
     def __init__(
@@ -1025,6 +1794,8 @@ class RandomListSRA(BaseEstimator):
         n_permutations: int = 100,
     ):
         super().__init__()
+        if n_permutations < 1:
+            raise ValueError("n_permutations must be at least 1.")
         self.config = SRAConfig(epsilon=epsilon, metric=metric, B=B)
         self.n_permutations = n_permutations
         self.result_ = None
@@ -1038,16 +1809,18 @@ class RandomListSRA(BaseEstimator):
         Parameters
         ----------
         X : array-like of shape (n_lists, list_length)
-            Ranked lists data. Each row represents a list.
+            Ranked lists data containing numeric item IDs (assumed 1-based).
+            Represents the structure (list lengths, number of lists) for permutation.
         nitems : int, optional
-            Total number of items. If None, inferred from X.
+            Total number of items in the universe (max item ID). If None,
+            inferred inside random_list_sra. Providing it is recommended.
 
         Returns
         -------
         self : object
             Fitted estimator.
         """
-        X = self._validate_input(X)
+        X = self._validate_input(X)  # Ensures X is 2D numeric array
         self.result_ = random_list_sra(
             X, self.config, self.n_permutations, nitems
         )
@@ -1057,12 +1830,16 @@ class RandomListSRA(BaseEstimator):
     @require_generated
     def get_result(self) -> RandomListSRAResult:
         """Get the null distribution generation result."""
+        if self.result_ is None:
+            raise ValueError(
+                "Null distribution not generated. Call 'generate' first."
+            )
         return self.result_
 
     @require_generated
     def distribution(self) -> np.ndarray:
         """Get the null distribution matrix."""
-        return self.result_.distribution
+        return self.get_result().distribution
 
     @require_generated
     def confidence_band(
@@ -1074,33 +1851,50 @@ class RandomListSRA(BaseEstimator):
         Parameters
         ----------
         confidence : float, default=0.95
-            Confidence level.
+            Confidence level (must be between 0 and 1).
 
         Returns
         -------
         band : dict
             Dictionary with 'lower' and 'upper' arrays.
         """
-        return self.result_.confidence_band(confidence)
+        if not 0 < confidence < 1:
+            raise ValueError("Confidence level must be between 0 and 1.")
+        return self.get_result().confidence_band(confidence)
 
     @require_generated
-    def quantiles(self, probs: list[float]) -> dict[float, np.ndarray]:
+    def quantiles(self, probs: float | list[float]) -> dict[float, np.ndarray]:
         """
         Compute quantiles of the null distribution for each depth.
 
         Parameters
         ----------
-        probs : list of float
-            Probability points at which to compute quantiles.
+        probs : float or list of float
+            Probability point(s) at which to compute quantiles (e.g., 0.025, 0.5, 0.975).
+            Each probability must be between 0 and 1.
 
         Returns
         -------
         quantiles : dict
             Dictionary mapping probabilities to quantile arrays.
         """
+        if isinstance(probs, (int, float)):
+            probs = [float(probs)]
+        elif not isinstance(probs, list) or not all(
+            isinstance(p, (int, float)) for p in probs
+        ):
+            raise TypeError("probs must be a float or a list of floats.")
+
+        if not all(0 <= p <= 1 for p in probs):
+            raise ValueError(
+                "All quantile probabilities must be between 0 and 1."
+            )
+
         result = {}
+        dist = self.distribution()  # Get the null distribution matrix
         for prob in probs:
-            result[prob] = np.quantile(self.result_.distribution, prob, axis=1)
+            # Calculate quantiles along the permutation axis (axis=1)
+            result[prob] = np.nanquantile(dist, prob, axis=1)  # Use nanquantile
         return result
 
 
@@ -1109,7 +1903,7 @@ class SRATest(BaseEstimator):
 
     Parameters
     ----------
-    style : {'l2', 'max'}, default='l2'
+    style : {'l2', 'max'}, default='max'
         Method to aggregate differences.
     window : int, default=1
         Size of smoothing window. Use 1 for no smoothing.
@@ -1121,7 +1915,7 @@ class SRATest(BaseEstimator):
 
     def __init__(
         self,
-        style: Literal["l2", "max"] = "l2",
+        style: Literal["l2", "max"] = "max",
         window: int = 1,
         use_gpd: bool = False,
         threshold_quantile: float = 0.90,
@@ -1146,9 +1940,10 @@ class SRATest(BaseEstimator):
         Parameters
         ----------
         observed_sra : SRAResult or array-like
-            Observed SRA values or result object.
+            Observed SRA values (1D array) or result object.
         null_dist : RandomListSRAResult or array-like
-            Null distribution of SRA values or result object.
+            Null distribution of SRA values (2D array, depths x permutations)
+            or result object.
 
         Returns
         -------
@@ -1158,24 +1953,30 @@ class SRATest(BaseEstimator):
         # Extract values if result objects are provided
         if isinstance(observed_sra, SRAResult):
             observed_values = observed_sra.values
-        else:
+        elif isinstance(observed_sra, (np.ndarray, list, tuple)):
             observed_values = np.asarray(observed_sra)
+        else:
+            raise TypeError("observed_sra must be SRAResult or array-like.")
 
         if isinstance(null_dist, RandomListSRAResult):
             null_values = null_dist.distribution
-        else:
+        elif isinstance(null_dist, (np.ndarray, list, tuple)):
             null_values = np.asarray(null_dist)
-
-        # Validate input
-        if observed_values.ndim != 1:
-            raise ValueError("observed_sra must be a 1D array or SRAResult")
-        if null_values.ndim != 2:
-            raise ValueError(
-                "null_dist must be a 2D array or RandomListSRAResult"
+        else:
+            raise TypeError(
+                "null_dist must be RandomListSRAResult or array-like."
             )
+
+        # Validate input dimensions after extraction
+        if observed_values.ndim != 1:
+            raise ValueError(
+                "observed_sra must be 1D array or yield a 1D array."
+            )
+        if null_values.ndim != 2:
+            raise ValueError("null_dist must be 2D array or yield a 2D array.")
         if observed_values.shape[0] != null_values.shape[0]:
             raise ValueError(
-                "observed_sra and null_dist must have same number of depths"
+                "observed_sra and null_dist must have same number of depths (first dimension)."
             )
 
         self.result_ = test_sra(observed_values, null_values, self.config)
@@ -1185,28 +1986,32 @@ class SRATest(BaseEstimator):
     @require_generated
     def get_result(self) -> TestResult:
         """Get the test result."""
+        if self.result_ is None:
+            raise ValueError("Test not performed. Call 'generate' first.")
         return self.result_
 
     @require_generated
     def p_value(self) -> float:
         """Get the p-value (GPD-based if available, otherwise empirical)."""
-        return self.result_.p_value
+        # Returns NaN if p-value calculation failed
+        return self.get_result().p_value
 
 
 class SRACompare(BaseEstimator):
-    """Compare two SRA curves.
+    """Compare two SRA curves based on their deviation from respective nulls.
 
     Parameters
     ----------
-    style : {'l2', 'max'}, default='l2'
-        Method to aggregate differences.
+    style : {'l2', 'max'}, default='max'
+        Method to aggregate differences for comparison statistic.
     window : int, default=1
         Size of smoothing window. Use 1 for no smoothing.
     """
 
-    def __init__(self, style: Literal["l2", "max"] = "l2", window: int = 1):
+    def __init__(self, style: Literal["l2", "max"] = "max", window: int = 1):
         super().__init__()
-        self.config = TestConfig(style=style, window=window)
+        # GPD not typically used in comparison context
+        self.config = TestConfig(style=style, window=window, use_gpd=False)
         self.result_ = None
 
     def generate(
@@ -1222,13 +2027,13 @@ class SRACompare(BaseEstimator):
         Parameters
         ----------
         sra1 : SRAResult or array-like
-            First SRA curve or result object.
+            First SRA curve (1D) or result object.
         sra2 : SRAResult or array-like
-            Second SRA curve or result object.
+            Second SRA curve (1D) or result object.
         null1 : RandomListSRAResult or array-like
-            Null distribution for first curve or result object.
+            Null distribution for first curve (2D) or result object.
         null2 : RandomListSRAResult or array-like
-            Null distribution for second curve or result object.
+            Null distribution for second curve (2D) or result object.
 
         Returns
         -------
@@ -1238,36 +2043,33 @@ class SRACompare(BaseEstimator):
         # Extract values if result objects are provided
         if isinstance(sra1, SRAResult):
             sra1_values = sra1.values
-        else:
+        elif isinstance(sra1, (np.ndarray, list, tuple)):
             sra1_values = np.asarray(sra1)
+        else:
+            raise TypeError("sra1 must be SRAResult or array-like.")
 
         if isinstance(sra2, SRAResult):
             sra2_values = sra2.values
-        else:
+        elif isinstance(sra2, (np.ndarray, list, tuple)):
             sra2_values = np.asarray(sra2)
+        else:
+            raise TypeError("sra2 must be SRAResult or array-like.")
 
         if isinstance(null1, RandomListSRAResult):
             null1_values = null1.distribution
-        else:
+        elif isinstance(null1, (np.ndarray, list, tuple)):
             null1_values = np.asarray(null1)
+        else:
+            raise TypeError("null1 must be RandomListSRAResult or array-like.")
 
         if isinstance(null2, RandomListSRAResult):
             null2_values = null2.distribution
-        else:
+        elif isinstance(null2, (np.ndarray, list, tuple)):
             null2_values = np.asarray(null2)
+        else:
+            raise TypeError("null2 must be RandomListSRAResult or array-like.")
 
-        # Validate input
-        if sra1_values.ndim != 1 or sra2_values.ndim != 1:
-            raise ValueError(
-                "SRA curves must be 1D arrays or SRAResult objects"
-            )
-        if sra1_values.shape[0] != sra2_values.shape[0]:
-            raise ValueError("SRA curves must have same length")
-        if null1_values.ndim != 2 or null2_values.ndim != 2:
-            raise ValueError(
-                "Null distributions must be 2D arrays or RandomListSRAResult objects"
-            )
-
+        # Basic validation done within compare_sra function
         self.result_ = compare_sra(
             sra1_values, sra2_values, null1_values, null2_values, self.config
         )
@@ -1277,12 +2079,15 @@ class SRACompare(BaseEstimator):
     @require_generated
     def get_result(self) -> ComparisonResult:
         """Get the comparison result."""
+        if self.result_ is None:
+            raise ValueError("Comparison not performed. Call 'generate' first.")
         return self.result_
 
     @require_generated
     def p_value(self) -> float:
         """Get the p-value for the comparison."""
-        return self.result_.p_value
+        # Returns NaN if p-value calculation failed
+        return self.get_result().p_value
 
 
 class RankPipeline:
@@ -1290,74 +2095,184 @@ class RankPipeline:
 
     This utility class provides a fluent API for building common analysis
     pipelines for ranked data, making it easy to perform typical analyses
-    with minimal code.
+    with minimal code. Handles data preparation using RankData internally.
 
     Attributes
     ----------
-    ranked_data : numpy.ndarray
-        Ranked data for analysis.
-    sra_config : SRAConfig
-        Configuration for SRA computation.
-    sra : SRA
-        SRA estimator.
-    null_config : dict
-        Configuration for null distribution generation.
-    null_dist : RandomListSRA
-        Null distribution estimator.
-    test_config : TestConfig
-        Configuration for significance testing.
-    test : SRATest
-        Test estimator.
+    input_data : Any
+        Stores the initial data provided (list of lists, scores, array).
+    input_type : str
+        Indicates the type of input ('items', 'scores', 'ranks').
+    ranked_data : numpy.ndarray | None
+        Numeric ranked data ready for SRA (LISTROW_RANKCOL format with 1-based IDs).
+    item_mapping : dict | None
+        Mapping generated by RankData.from_items, if used.
+    nitems : int | None
+        Total number of unique items, determined during data preparation.
+    sra_config : SRAConfig | None
+        Configuration used for SRA computation.
+    sra : SRA | None
+        SRA estimator instance.
+    null_config : dict | None
+        Configuration used for null distribution generation.
+    null_dist : RandomListSRA | None
+        Null distribution estimator instance.
+    test_config : TestConfig | None
+        Configuration used for significance testing.
+    test : SRATest | None
+        Test estimator instance.
     """
 
     def __init__(self):
+        self._input_data = None
+        self._input_type = None
         self.ranked_data = None
+        self.item_mapping = None
+        self.nitems = None
         self.sra_config = None
         self.sra = None
         self.null_config = None
         self.null_dist = None
         self.test_config = None
         self.test = None
+        self._generated = (
+            False  # Track if pipeline steps requiring data are done
+        )
 
-    def with_ranked_data(self, data: np.ndarray) -> "RankPipeline":
+    def _prepare_data(self):
+        """Internal method to process input data into numeric ranks."""
+        if self.ranked_data is not None:  # Already prepared
+            return
+
+        if self._input_data is None:
+            raise ValueError(
+                "No input data provided. Use with_... methods first."
+            )
+
+        if self._input_type == "ranks":
+            # Input is assumed to be pre-formatted numeric ranks (LISTROW_RANKCOL)
+            try:
+                self.ranked_data = np.asarray(self._input_data, dtype=float)
+            except ValueError:
+                raise ValueError(
+                    "Input data for 'with_ranked_data' must be numeric or convertible."
+                )
+            if self.ranked_data.ndim != 2:
+                raise ValueError(
+                    "Input data for 'with_ranked_data' must be 2D."
+                )
+            # Infer nitems from max ID if possible
+            present_ids = self.ranked_data[~np.isnan(self.ranked_data)]
+            if present_ids.size > 0:
+                self.nitems = int(np.nanmax(present_ids))
+            else:  # Fallback to width if all NaN or empty
+                self.nitems = self.ranked_data.shape[1]
+            self.item_mapping = None  # No mapping for direct ranks
+
+        elif self._input_type == "items":
+            # Input is list of lists or array of items
+            data, mapping = RankData.from_items(
+                self._input_data["items_lists"],
+                self._input_data.get("na_strings"),
+            )
+            self.ranked_data = data
+            self.item_mapping = mapping
+            self.nitems = len(
+                mapping["id_to_item"]
+            )  # Number of unique items found
+
+        elif self._input_type == "scores":
+            # Input is list of lists of scores
+            data = RankData.from_scores(
+                self._input_data["scores"], self._input_data["ascending"]
+            )
+            self.ranked_data = data  # This is LISTROW_ITEMCOL format
+            self.item_mapping = None
+            # Cannot easily determine nitems or use directly with compute_sra yet.
+            # Needs conversion from ITEMCOL to RANKCOL first.
+            # This path requires revision if SRA expects RANKCOL.
+            # FOR NOW: Let's assume SRA needs RANKCOL and disallow scores for simplicity
+            # OR modify pipeline to convert scores -> ITEMCOL -> RANKCOL
+            raise NotImplementedError(
+                "Pipeline support for 'with_scores' requires conversion step "
+                "to LISTROW_RANKCOL format expected by SRA. Use 'with_items_lists' "
+                "or 'with_ranked_data' (with numeric item IDs) instead."
+            )
+
+        else:
+            raise ValueError("Invalid input type state.")
+
+        if self.ranked_data is None or self.nitems is None:
+            raise ValueError("Data preparation failed.")
+        self._generated = True
+
+    def with_ranked_data(
+        self, data: np.ndarray | list[list[float]]
+    ) -> "RankPipeline":
         """
-        Set the ranked data for analysis.
+        Set the ranked data directly. Assumes LISTROW_RANKCOL format with
+        numeric (1-based recommended) item IDs.
 
         Parameters
         ----------
-        data : array-like
-            Ranked lists data. Each row represents a list.
+        data : array-like of shape (n_lists, list_length)
+            Ranked lists data with numeric item IDs.
 
         Returns
         -------
         self : RankPipeline
             For method chaining.
         """
-        self.ranked_data = np.asarray(data)
+        if self._input_data is not None:
+            raise ValueError("Input data already set.")
+        self._input_data = data
+        self._input_type = "ranks"
+        # Defer actual processing until needed
+        self.ranked_data = None
+        self.item_mapping = None
+        self.nitems = None
+        self._generated = False
         return self
 
-    def with_items_lists(self, items_lists: list[list[Any]]) -> "RankPipeline":
+    def with_items_lists(
+        self,
+        items_lists: list[list[Any]] | np.ndarray,
+        na_strings: Optional[list[str]] = None,
+    ) -> "RankPipeline":
         """
-        Set ranked data from lists of items.
+        Set ranked data from lists/arrays of named items. Items will be mapped
+        to dense 1-based numeric IDs internally.
 
         Parameters
         ----------
-        items_lists : list of lists
-            Each inner list contains items in their ranked order.
+        items_lists : list of lists or numpy.ndarray
+            Each inner list/row contains items in their ranked order.
+        na_strings : Optional[list[str]], default=["", "nan", "na", "null", "none"]
+            Case-insensitive strings to interpret as NA in array input.
 
         Returns
         -------
         self : RankPipeline
             For method chaining.
         """
-        self.ranked_data = RankData.from_items(items_lists)
+        if self._input_data is not None:
+            raise ValueError("Input data already set.")
+        self._input_data = {
+            "items_lists": items_lists,
+            "na_strings": na_strings,
+        }
+        self._input_type = "items"
+        self.ranked_data = None
+        self.item_mapping = None
+        self.nitems = None
+        self._generated = False
         return self
 
     def with_scores(
         self, scores: list[list[float]], ascending: bool = True
     ) -> "RankPipeline":
         """
-        Set ranked data from lists of scores.
+        Set ranked data from lists of scores. (Currently Not Fully Supported in Pipeline).
 
         Parameters
         ----------
@@ -1365,25 +2280,43 @@ class RankPipeline:
             Each inner list contains numeric scores.
         ascending : bool, default=True
             If True, lower scores get lower ranks (e.g., for p-values).
-            If False, higher scores get lower ranks (e.g., for correlations).
 
         Returns
         -------
         self : RankPipeline
             For method chaining.
+
+        Raises
+        ------
+        NotImplementedError
+            This method is not fully supported as the pipeline expects LISTROW_RANKCOL input.
         """
-        self.ranked_data = RankData.from_scores(scores, ascending=ascending)
-        return self
+        if self._input_data is not None:
+            raise ValueError("Input data already set.")
+        # Store input config, but mark as not directly usable yet
+        self._input_data = {"scores": scores, "ascending": ascending}
+        self._input_type = "scores"
+        self.ranked_data = None
+        self.item_mapping = None
+        self.nitems = None
+        self._generated = False
+        # Raise error immediately or during _prepare_data? Let's raise here for clarity.
+        raise NotImplementedError(
+            "Pipeline 'with_scores' requires internal conversion to LISTROW_RANKCOL "
+            "which is not yet implemented. Please use 'with_items_lists' or "
+            "'with_ranked_data' with numeric IDs."
+        )
+        # return self # If we were to implement it later
 
     def compute_sra(
         self,
         epsilon: float | np.ndarray = 0.0,
         metric: Literal["sd", "mad"] = "sd",
         B: int = 1,
-        nitems: Optional[int] = None,
+        # nitems is now inferred/handled internally by _prepare_data
     ) -> "RankPipeline":
         """
-        Compute SRA for the ranked data.
+        Compute SRA for the prepared ranked data.
 
         Parameters
         ----------
@@ -1393,69 +2326,75 @@ class RankPipeline:
             Method to measure dispersion of ranks.
         B : int, default=1
             Number of bootstrap samples for handling missing values.
-        nitems : int, optional
-            Total number of items. If None, inferred from ranked_data.
 
         Returns
         -------
         self : RankPipeline
             For method chaining.
         """
-        if self.ranked_data is None:
-            raise ValueError("Ranked data must be set before computing SRA")
+        if not self._generated:
+            self._prepare_data()  # Ensure ranked_data and nitems are set
+
+        if self.ranked_data is None or self.nitems is None:
+            # Should have been caught by _prepare_data, but double-check
+            raise ValueError(
+                "Ranked data must be successfully prepared before computing SRA."
+            )
 
         self.sra_config = SRAConfig(epsilon=epsilon, metric=metric, B=B)
-        self.sra = SRA(epsilon=epsilon, metric=metric, B=B).generate(
-            self.ranked_data, nitems=nitems
-        )
-
+        self.sra = SRA(
+            epsilon=self.sra_config.epsilon,
+            metric=self.sra_config.metric,
+            B=self.sra_config.B,
+        ).generate(self.ranked_data, nitems=self.nitems)
         return self
 
     def random_list_sra(
         self,
         n_permutations: int = 100,
-        nitems: Optional[int] = None,
+        # nitems is inferred/handled internally by _prepare_data
     ) -> "RankPipeline":
         """
-        Generate null distribution for the ranked data.
+        Generate null distribution for the prepared ranked data. Uses SRA parameters
+        if compute_sra was called, otherwise uses defaults.
 
         Parameters
         ----------
         n_permutations : int, default=100
             Number of permutations to generate.
-        nitems : int, optional
-            Total number of items. If None, inferred from ranked_data.
-        n_jobs : int, default=1
-            Number of jobs for parallel processing. Use -1 to use all available cores.
 
         Returns
         -------
         self : RankPipeline
             For method chaining.
         """
-        if self.ranked_data is None:
+        if not self._generated:
+            self._prepare_data()
+
+        if self.ranked_data is None or self.nitems is None:
             raise ValueError(
-                "Ranked data must be set before generating null distribution"
+                "Ranked data must be successfully prepared before generating null distribution."
             )
 
-        if self.sra_config is None:
-            warnings.warn("Using default SRA parameters for null distribution")
-            self.sra_config = SRAConfig()
+        # Use SRA config if available, otherwise default
+        sra_conf = (
+            self.sra_config if self.sra_config is not None else SRAConfig()
+        )
 
         self.null_config = {"n_permutations": n_permutations}
 
         self.null_dist = RandomListSRA(
-            epsilon=self.sra_config.epsilon,
-            metric=self.sra_config.metric,
-            B=self.sra_config.B,
+            epsilon=sra_conf.epsilon,
+            metric=sra_conf.metric,
+            B=sra_conf.B,
             n_permutations=n_permutations,
-        ).generate(self.ranked_data, nitems=nitems)
+        ).generate(self.ranked_data, nitems=self.nitems)
 
         return self
 
     def test_significance(
         self,
-        style: Literal["l2", "max"] = "l2",
+        style: Literal["l2", "max"] = "max",
         window: int = 1,
         use_gpd: bool = False,
         threshold_quantile: float = 0.90,
@@ -1463,9 +2402,11 @@ class RankPipeline:
         """
         Test significance of observed SRA against null distribution.
 
+        Requires compute_sra() and random_list_sra() to be called first.
+
         Parameters
         ----------
-        style : {'l2', 'max'}, default='l2'
+        style : {'l2', 'max'}, default='max'
             Method to aggregate differences.
         window : int, default=1
             Size of smoothing window. Use 1 for no smoothing.
@@ -1479,11 +2420,13 @@ class RankPipeline:
         self : RankPipeline
             For method chaining.
         """
-        if self.sra is None:
-            raise ValueError("SRA must be computed before testing significance")
-        if self.null_dist is None:
+        if self.sra is None or not self.sra.fitted_:
             raise ValueError(
-                "Null distribution must be generated before testing significance"
+                "SRA must be computed before testing significance (call compute_sra)."
+            )
+        if self.null_dist is None or not self.null_dist.fitted_:
+            raise ValueError(
+                "Null distribution must be generated before testing significance (call random_list_sra)."
             )
 
         self.test_config = TestConfig(
@@ -1504,31 +2447,62 @@ class RankPipeline:
 
     def build(self) -> dict[str, Any]:
         """
-        Build and return the analysis results.
+        Build and return the analysis results collected in the pipeline.
+
+        Ensures data preparation is done if not already performed.
 
         Returns
         -------
         results : dict
-            Dictionary containing analysis results.
+            Dictionary containing analysis results ('sra', 'null_distribution', 'test',
+            'item_mapping', 'p_value', 'significant', etc., where applicable).
         """
+        if not self._generated:
+            try:
+                self._prepare_data()
+            except Exception as e:
+                return {"error": f"Data preparation failed: {e}"}
+
         result = {}
 
-        if self.sra is not None:
-            result["sra"] = self.sra
+        if self.item_mapping is not None:
+            result["item_mapping"] = self.item_mapping
+
+        if self.sra is not None and self.sra.fitted_:
+            result["sra_estimator"] = self.sra
             result["sra_result"] = self.sra.get_result()
+            result["sra_values"] = result["sra_result"].values
+            result["when_included"] = result["sra_result"].when_included
 
-        if self.null_dist is not None:
-            result["null_distribution"] = self.null_dist
+        if self.null_dist is not None and self.null_dist.fitted_:
+            result["null_estimator"] = self.null_dist
             result["null_result"] = self.null_dist.get_result()
+            result["null_distribution"] = result["null_result"].distribution
 
-            if self.sra is not None:
+            # Add confidence band only if null distribution is available
+            try:
                 result["confidence_band"] = self.null_dist.confidence_band()
+            except Exception as e:
+                warnings.warn(f"Could not compute confidence band: {e}")
 
-        if self.test is not None:
-            result["test"] = self.test
+        if self.test is not None and self.test.fitted_:
+            result["test_estimator"] = self.test
             result["test_result"] = self.test.get_result()
             result["p_value"] = self.test.p_value()
-            result["significant"] = self.test.p_value() < 0.05
+            # Handle potential NaN p-value
+            if result["p_value"] is not None and not np.isnan(
+                result["p_value"]
+            ):
+                result["significant_05"] = result["p_value"] < 0.05
+            else:
+                result["significant_05"] = (
+                    None  # Indicate significance couldn't be determined
+                )
+
+        if not result:
+            warnings.warn(
+                "Pipeline built with no analysis steps performed or data prepared."
+            )
 
         return result
 
@@ -1538,12 +2512,13 @@ class RankPipeline:
 ###################
 
 
+# (Keep example_usage function as is, it doesn't need modification for the internal fixes)
 def example_usage():
     """
     Demonstrate example usage of the SuperRanker package.
     """
-    # Sample ranked lists
-    ranks = np.array(
+    # Sample ranked lists with numeric IDs (1-based)
+    ranks_numeric = np.array(
         [
             [1, 2, 3, 4, 5, 6, 7, 8],
             [1, 2, 3, 5, 6, 7, 4, 8],
@@ -1551,122 +2526,239 @@ def example_usage():
         ]
     )
 
-    # Using the Pipeline API
-    print("Using Pipeline API:")
-    results = (
+    # Using the Pipeline API with pre-defined numeric ranks
+    print("Using Pipeline API with numeric ranks:")
+    # Explicitly state nitems, though it could be inferred correctly here
+    n_items_in_example = 8
+    results_numeric = (
         RankPipeline()
-        .with_ranked_data(ranks)
-        .compute_sra(epsilon=0.0, metric="sd", B=1)
-        .random_list_sra(n_permutations=10000)
+        .with_ranked_data(ranks_numeric)
+        .compute_sra(epsilon=0.0, metric="sd", B=1)  # nitems handled internally
+        .random_list_sra(n_permutations=1000)  # nitems handled internally
         .test_significance(style="max", window=1, use_gpd=False)
         .build()
     )
 
-    print(f"SRA first 5 values: {results['sra_result'].values[:5]}")
-    print(f"P-value: {results['p_value']}")
-    print(f"Significant: {results['significant']}")
+    if "error" in results_numeric:
+        print(f"Pipeline failed: {results_numeric['error']}")
+    else:
+        print(
+            f"SRA first 5 values: {results_numeric.get('sra_values', [])[:5]}"
+        )
+        print(f"P-value: {results_numeric.get('p_value', 'N/A')}")
+        print(
+            f"Significant (p<0.05): {results_numeric.get('significant_05', 'N/A')}"
+        )
+        # print(f"When Included (first 5): {results_numeric.get('when_included', [])[:5]}")
 
-    # Using the direct API
+    # Using the direct API (more verbose, shows underlying steps)
     print("\nUsing Direct API:")
-    sra_config = SRAConfig(epsilon=0.0, metric="sd", B=1)
-    sra_estimator = SRA(
-        epsilon=sra_config.epsilon, metric=sra_config.metric, B=sra_config.B
-    ).generate(ranks)
-    sra_result = sra_estimator.get_result()
+    try:
+        sra_config = SRAConfig(epsilon=0.0, metric="sd", B=1)
+        # Generate requires data and optionally nitems
+        sra_estimator = SRA().generate(ranks_numeric, nitems=n_items_in_example)
+        sra_result = sra_estimator.get_result()
 
-    null_estimator = RandomListSRA(
-        epsilon=sra_config.epsilon,
-        metric=sra_config.metric,
-        B=sra_config.B,
-        n_permutations=10000,
-    ).generate(ranks)
-    null_result = null_estimator.get_result()
+        null_estimator = RandomListSRA(
+            epsilon=sra_config.epsilon,
+            metric=sra_config.metric,
+            B=sra_config.B,
+            n_permutations=1000,
+        ).generate(
+            ranks_numeric, nitems=n_items_in_example
+        )  # Pass data structure and nitems
+        null_result = null_estimator.get_result()
 
-    test_config = TestConfig(style="max", use_gpd=False)
-    test = SRATest(
-        style=test_config.style, use_gpd=test_config.use_gpd
-    ).generate(sra_result, null_result)
-    test_result = test.get_result()
+        test_config = TestConfig(style="max", use_gpd=False)
+        test_estimator = SRATest(
+            style=test_config.style, use_gpd=test_config.use_gpd
+        ).generate(sra_result, null_result)  # Pass results or arrays
+        test_result = test_estimator.get_result()
 
-    print(f"Direct SRA first 5 values: {sra_result.values[:5]}")
-    print(f"Direct P-value: {test_result.p_value}")
+        print(f"Direct SRA first 5 values: {sra_result.values[:5]}")
+        print(f"Direct P-value: {test_result.p_value}")
+        # print(f"Direct When Included (first 5): {sra_result.when_included[:5] if sra_result.when_included is not None else 'N/A'}")
 
-    # Working with items directly
-    print("\nWorking with Item Lists:")
+    except Exception as e:
+        print(f"Direct API execution failed: {e}")
+
+    # Using Item Lists (Strings)
+    print("\nUsing Item Lists (Strings):")
     gene_lists = [
         [
-            "Gene1",
-            "Gene2",
-            "Gene3",
-            "Gene4",
-            "Gene5",
-            "Gene6",
-            "Gene7",
-            "Gene8",
+            "GeneA",
+            "GeneB",
+            "GeneC",
+            "GeneD",
+            "GeneE",
+            "GeneF",
+            "GeneG",
+            "GeneH",
         ],
         [
-            "Gene1",
-            "Gene2",
-            "Gene3",
-            "Gene5",
-            "Gene6",
-            "Gene7",
-            "Gene4",
-            "Gene8",
+            "GeneA",
+            "GeneB",
+            "GeneC",
+            "GeneE",
+            "GeneF",
+            "GeneG",
+            "GeneD",
+            "GeneH",
         ],
         [
-            "Gene1",
-            "Gene5",
-            "Gene3",
-            "Gene4",
-            "Gene2",
-            "Gene8",
-            "Gene7",
-            "Gene6",
+            "GeneA",
+            "GeneE",
+            "GeneC",
+            "GeneD",
+            "GeneB",
+            "GeneH",
+            "GeneG",
+            "GeneF",
+        ],
+        # Add a shorter list to test padding/NaN handling
+        ["GeneA", "GeneC", "GeneB", None, "GeneG"],
+        # Add a list with a previously unseen item
+        [
+            "GeneI",
+            "GeneA",
+            "GeneH",
+            "GeneB",
+            "GeneC",
+            "GeneD",
+            "GeneE",
+            "GeneF",
         ],
     ]
 
-    # With the same parameters as the original example
-    results_genes = (
+    results_items = (
         RankPipeline()
         .with_items_lists(gene_lists)
-        .compute_sra(epsilon=0.0, metric="sd", B=1)
-        .random_list_sra(n_permutations=10000)
+        .compute_sra(
+            epsilon=0.0, metric="sd", B=1
+        )  # nitems inferred from unique items
+        .random_list_sra(n_permutations=1000)  # nitems inferred
         .test_significance(style="max", window=1, use_gpd=False)
         .build()
     )
 
-    print(f"Gene SRA values: {results_genes['sra_result'].values[:5]}")
-    print(f"Gene test p-value: {results_genes['p_value']}")
-    print(f"Significant: {results_genes['significant']}")
-    # Compare two methods
+    if "error" in results_items:
+        print(f"Pipeline failed: {results_items['error']}")
+    else:
+        print(
+            f"Item List SRA first 5 values: {results_items.get('sra_values', [])[:5]}"
+        )
+        print(f"Item List P-value: {results_items.get('p_value', 'N/A')}")
+        print(
+            f"Significant (p<0.05): {results_items.get('significant_05', 'N/A')}"
+        )
+
+        if "item_mapping" in results_items:
+            print("\nItem mapping created:")
+            # Limit printing for brevity
+            items_to_print = list(
+                results_items["item_mapping"]["item_to_id"].items()
+            )[:5]
+            for item, id_val in items_to_print:
+                print(f"  {item} -> ID {id_val}")
+            print(
+                f"  ... ({len(results_items['item_mapping']['item_to_id'])} total items)"
+            )
+
+        # Check if when_included was calculated
+        when_inc = results_items.get("when_included")
+        if when_inc is not None:
+            print(f"\nWhen Included (first 5 items by ID 1-5): {when_inc[:5]}")
+        else:
+            print("\nWhen Included data was not calculated.")
+
+    # Example with sparse/large IDs (would have failed before)
+    print("\nUsing large/sparse numeric IDs:")
+    # Item IDs are 10, 20, 5000, 60000
+    ranks_large_ids = np.array(
+        [[10, 5000, 20, np.nan], [20, 10, 60000, 5000], [10, 20, 5000, 60000]]
+    )
+    # We should provide nitems if known, otherwise it's inferred as max(ID)=60000
+    n_items_large = 60000
+
+    results_large = (
+        RankPipeline()
+        .with_ranked_data(ranks_large_ids)
+        # .compute_sra(B=1) # nitems handled internally
+        # .random_list_sra(n_permutations=100) # Reduced perms for speed
+        # .test_significance()
+        .build()  # Just build to check data prep, computation might be slow
+    )
+
+    if "error" in results_large:
+        print(f"Pipeline failed: {results_large['error']}")
+    elif results_large.get("ranked_data") is not None:
+        print(
+            f"Data prepared successfully. Inferred nitems: {results_large.get('nitems')}"
+        )
+        print(
+            "Note: Full SRA computation with very large nitems can be slow/memory intensive."
+        )
+        # Can optionally run compute_sra etc. here if desired, e.g.:
+        # results_large = (
+        #      RankPipeline()
+        #      .with_ranked_data(ranks_large_ids)
+        #      .compute_sra(B=1).build() # Compute just SRA
+        # )
+        # print(f"SRA Values (first 5): {results_large.get('sra_values', [])[:5]}")
+    else:
+        print("Pipeline build step failed for large IDs.")
+
+    # Compare two methods example
     print("\nComparing Two Methods:")
+    # Method 1: Two lists, 8 items (IDs 1-8)
     method1_ranks = np.array(
         [[1, 2, 3, 4, 5, 6, 7, 8], [1, 2, 3, 5, 6, 7, 4, 8]]
     )
+    n1 = 8
 
+    # Method 2: Two lists, different items/ranking (IDs 1-8 still)
     method2_ranks = np.array(
         [[1, 5, 3, 4, 2, 8, 7, 6], [2, 1, 5, 3, 4, 7, 8, 6]]
     )
+    n2 = 8
 
-    # Calculate SRAs for both methods
-    sra1 = SRA().generate(method1_ranks).get_result()
-    sra2 = SRA().generate(method2_ranks).get_result()
+    try:
+        # Calculate SRAs for both methods
+        sra1 = SRA().generate(method1_ranks, nitems=n1).get_result()
+        sra2 = SRA().generate(method2_ranks, nitems=n2).get_result()
 
-    # Generate null distributions
-    null1 = (
-        RandomListSRA(n_permutations=50).generate(method1_ranks).get_result()
-    )
-    null2 = (
-        RandomListSRA(n_permutations=50).generate(method2_ranks).get_result()
-    )
+        # Generate null distributions (use fewer permutations for example speed)
+        null1 = (
+            RandomListSRA(n_permutations=200)
+            .generate(method1_ranks, nitems=n1)
+            .get_result()
+        )
+        null2 = (
+            RandomListSRA(n_permutations=200)
+            .generate(method2_ranks, nitems=n2)
+            .get_result()
+        )
 
-    # Compare methods
-    compare = SRACompare().generate(sra1, sra2, null1, null2)
-    compare_result = compare.get_result()
+        # Compare methods
+        compare_estimator = SRACompare(style="max").generate(
+            sra1, sra2, null1, null2
+        )
+        compare_result = compare_estimator.get_result()
 
-    print(f"Method comparison p-value: {compare_result.p_value}")
+        print(f"Method comparison p-value: {compare_result.p_value}")
+
+    except Exception as e:
+        print(f"Comparison execution failed: {e}")
 
 
 if __name__ == "__main__":
-    example_usage()
+    # Need to wrap example usage in a function to avoid NameError
+    # for rank_array_adapter if it's not found globally
+    try:
+        from enum import Enum  # Make Enum available if adapter failed import
+
+        example_usage()
+    except ImportError as e:
+        print(f"Could not run example: {e}")
+    except Exception as e:
+        print(f"An error occurred during example usage: {e}")
