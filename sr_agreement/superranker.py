@@ -962,69 +962,130 @@ def random_list_sra(
     n_permutations: int = 100,
     nitems: Optional[int] = None,
 ) -> RandomListSRAResult:
-    # Validate input type early
+    """
+    Generate null distribution for SRA by permuting lists, respecting original list lengths.
+
+    Parameters
+    ----------
+    ranked_lists : numpy.ndarray or list of lists
+        Array or list of shape (n_lists, list_length) where each row/list
+        contains numeric item IDs (assumed 1-based).
+    config : SRAConfig
+        Configuration for SRA computation (used by compute_sra).
+    n_permutations : int, default=100
+        Number of permutations to generate.
+    nitems : int, optional
+        Total number of items in the universe (max item ID). If None, inferred.
+        Crucial for defining the universe from which permutations are drawn.
+
+    Returns
+    -------
+    result : RandomListSRAResult
+        Container for null distribution results.
+    """
+
     if not isinstance(ranked_lists, np.ndarray):
         try:
-            ranked_lists = np.array(ranked_lists, dtype=float)
-        except ValueError:
+            # Convert list of lists, handling varying lengths by finding max
+            if isinstance(ranked_lists, list) and ranked_lists:
+                max_len = (
+                    max(len(sublist) for sublist in ranked_lists)
+                    if ranked_lists
+                    else 0
+                )
+
+                padded_lists = []
+                for sublist in ranked_lists:
+                    padded_sublist = list(sublist) + [np.nan] * (
+                        max_len - len(sublist)
+                    )
+                    padded_lists.append(padded_sublist)
+                ranked_lists_arr = np.array(padded_lists, dtype=float)
+            else:
+                ranked_lists_arr = np.array(ranked_lists, dtype=float)
+        except (ValueError, TypeError):
             raise TypeError(
-                "Input ranked_lists must be array-like and numeric."
+                "Input ranked_lists must be array-like and numeric or list of numeric lists."
             )
-    elif not np.issubdtype(ranked_lists.dtype, np.number):
-        # Input is ndarray but not numeric
+    else:
+        ranked_lists_arr = ranked_lists
+
+    if not np.issubdtype(ranked_lists_arr.dtype, np.number):
         try:
-            ranked_lists = ranked_lists.astype(float)
+            ranked_lists_arr = ranked_lists_arr.astype(float)
         except ValueError:
             raise TypeError("Input ranked_lists NumPy array must be numeric.")
 
-    if ranked_lists.ndim != 2:
-        raise ValueError("Input ranked_lists must be 2D.")
+    if ranked_lists_arr.ndim != 2:
+        if (
+            ranked_lists_arr.size == 0
+            and isinstance(ranked_lists, list)
+            and not ranked_lists
+        ):
+            num_lists = 0
+            original_list_length = 0
+        else:
+            raise ValueError("Input ranked_lists must be 2D.")
+    else:
+        num_lists, original_list_length = ranked_lists_arr.shape
 
-    num_lists, list_length = ranked_lists.shape
+    real_lengths = np.sum(~np.isnan(ranked_lists_arr), axis=1).astype(int)
 
-    # Determine nitems
-    original_nitems = nitems
-    if nitems is None:
-        present_ids = ranked_lists[~np.isnan(ranked_lists)]
+    # Determine nitems (total universe size)
+    final_nitems = nitems
+    if final_nitems is None:
+        present_ids = ranked_lists_arr[~np.isnan(ranked_lists_arr)]
         if present_ids.size > 0:
             max_id = int(np.nanmax(present_ids))
-            nitems = max(max_id, list_length)
-            if nitems > list_length and original_nitems is None:
-                warnings.warn(
-                    f"Inferred nitems={nitems} from max item ID found, "
-                    f"which is greater than list_length={list_length}. Using this for permutations."
-                )
+            final_nitems = max(max_id, original_list_length, 1)
         else:
-            nitems = list_length
-        if nitems == 0:
-            raise ValueError("Cannot generate null distribution with nitems=0.")
+            final_nitems = max(original_list_length, 1)
+
+        if nitems is None and final_nitems > original_list_length:
+            warnings.warn(
+                f"Inferred nitems={final_nitems} from max item ID found, "
+                f"which is greater than original list_length={original_list_length}. Using this for permutations."
+            )
+        nitems = final_nitems
     elif not isinstance(nitems, int) or nitems <= 0:
         raise ValueError("nitems must be a positive integer.")
+    else:
+        final_nitems = nitems
 
-    # Pad input if necessary BEFORE calculating non-missing counts
-    if list_length < nitems:
-        pad_width = nitems - list_length
-        pad = np.full((num_lists, pad_width), np.nan)
-        ranked_lists = np.concatenate([ranked_lists, pad], axis=1)
-        list_length = nitems  # Update list_length
-    elif list_length > nitems:
-        warnings.warn(
-            f"Input list_length ({list_length}) > specified nitems ({nitems}). Truncating lists for null generation."
+    processed_ranked_lists = ranked_lists_arr
+    current_list_length = original_list_length
+
+    if current_list_length < final_nitems:
+        pad_width = final_nitems - current_list_length
+        # Ensure padding uses float NaN
+        pad = np.full((num_lists, pad_width), np.nan, dtype=float)
+        processed_ranked_lists = np.concatenate(
+            [processed_ranked_lists, pad], axis=1
         )
-        ranked_lists = ranked_lists[:, :nitems]
-        list_length = nitems
+        current_list_length = final_nitems
+    elif current_list_length > final_nitems:
+        warnings.warn(
+            f"Input list_length ({current_list_length}) > specified nitems ({final_nitems}). Truncating lists for null generation."
+        )
+        processed_ranked_lists = processed_ranked_lists[:, :final_nitems]
+        current_list_length = final_nitems
 
-    # Count how many items are actually non-missing in each row of the potentially padded/truncated array
-    notmiss = np.sum(~np.isnan(ranked_lists), axis=1).astype(int)
-
-    # Pre-generate random partial-permutations for each row
+    # Pre-generate random partial-permutations for each list based on its length
     sample_list = []
-    all_possible_ids = np.arange(1, nitems + 1)
-    for nn in notmiss:
-        # nn is how many items are actually observed
-        # generate n_permutations permutations of [1..nitems], each truncated to length nn
+    all_possible_ids = np.arange(1, final_nitems + 1)
+
+    for nn in real_lengths:
+        # nn is the number of non-NaN items originally in this list
+        # Generate n_permutations permutations of [1..final_nitems], each truncated to size nn
+        # Ensure nn doesn't exceed number of unique IDs if nitems is small
+        size_to_sample = min(nn, final_nitems)
+        if size_to_sample < 0:
+            size_to_sample = 0  # Handle empty list case
+
         row_samples = [
-            np.random.choice(all_possible_ids, size=nn, replace=False)
+            np.random.choice(
+                all_possible_ids, size=size_to_sample, replace=False
+            )
             for _ in range(n_permutations)
         ]
         sample_list.append(row_samples)
@@ -1032,21 +1093,27 @@ def random_list_sra(
     # Now build each random replicate and compute SRA
     sra_results = []
     for i in range(n_permutations):
-        # For each replicate i, assemble a new matrix from row i's partial permutations
-        # Ensure the matrix has the full nitems columns for compute_sra
-        current_obj = np.full((num_lists, nitems), np.nan, dtype=float)
+        # Assemble a new matrix for this permutation replicate.
+        # It needs the shape expected by compute_sra (num_lists, final_nitems)
+        current_obj = np.full((num_lists, final_nitems), np.nan, dtype=float)
+
         for row_idx in range(num_lists):
-            nn = notmiss[row_idx]
+            nn = min(real_lengths[row_idx], final_nitems)
             if nn > 0:
-                # Place the sampled items into the first nn columns
+                # Place the 'nn' sampled items into the first 'nn' columns
                 current_obj[row_idx, :nn] = sample_list[row_idx][i]
 
-        # Compute SRA on that entire matrix, passing the consistent nitems
-        sra_curve = compute_sra(current_obj, config, nitems).values
+        # Compute SRA on the assembled matrix for this replicate.
+        sra_curve = compute_sra(current_obj, config, nitems=final_nitems).values
         sra_results.append(sra_curve)
 
     # Combine into a distribution of shape (nitems, n_permutations)
-    null_distribution = np.column_stack(sra_results)
+    # NB. len(sra_curve) (& rows of null_distribution) will be final_nitems.
+    if not sra_results:  # Handle case of 0 permutations or 0 lists
+        null_distribution = np.empty((final_nitems, 0), dtype=float)
+    else:
+        null_distribution = np.column_stack(sra_results)
+
     return RandomListSRAResult(
         distribution=null_distribution,
         config=config,
@@ -2098,7 +2165,7 @@ class RankPipeline:
             False  # Track if pipeline steps requiring data are done
         )
 
-    def _prepare_data(self):
+    def _prepare_data(self, nitems: Optional[int] = None) -> None:
         """Internal method to process input data into numeric ranks."""
         if self.ranked_data is not None:  # Already prepared
             return
@@ -2120,12 +2187,16 @@ class RankPipeline:
                 raise ValueError(
                     "Input data for 'with_ranked_data' must be 2D."
                 )
-            # Infer nitems from max ID if possible
-            present_ids = self.ranked_data[~np.isnan(self.ranked_data)]
-            if present_ids.size > 0:
-                self.nitems = int(np.nanmax(present_ids))
-            else:  # Fallback to width if all NaN or empty
-                self.nitems = self.ranked_data.shape[1]
+
+            if nitems is not None:
+                self.nitems = nitems
+            else:
+                # Infer nitems from max ID if possible
+                present_ids = self.ranked_data[~np.isnan(self.ranked_data)]
+                if present_ids.size > 0:
+                    self.nitems = int(np.nanmax(present_ids))
+                else:  # Fallback to width if all NaN or empty
+                    self.nitems = self.ranked_data.shape[1]
             self.item_mapping = None  # No mapping for direct ranks
 
         elif self._input_type == "items":
@@ -2136,9 +2207,13 @@ class RankPipeline:
             )
             self.ranked_data = data
             self.item_mapping = mapping
-            self.nitems = len(
-                mapping["id_to_item"]
-            )  # Number of unique items found
+            # Use provided nitems or infer from mapping
+            if nitems is not None:
+                self.nitems = nitems
+            else:
+                self.nitems = len(
+                    mapping["id_to_item"]
+                )  # Number of unique items found
 
         elif self._input_type == "scores":
             # Input is list of lists of scores
@@ -2147,11 +2222,11 @@ class RankPipeline:
             )
             self.ranked_data = data  # This is LISTROW_ITEMCOL format
             self.item_mapping = None
-            # Cannot easily determine nitems or use directly with compute_sra yet.
+            # Use provided nitems if available
+            if nitems is not None:
+                self.nitems = nitems
+            # Otherwise, cannot easily determine nitems
             # Needs conversion from ITEMCOL to RANKCOL first.
-            # This path requires revision if SRA expects RANKCOL.
-            # FOR NOW: Let's assume SRA needs RANKCOL and disallow scores for simplicity
-            # OR modify pipeline to convert scores -> ITEMCOL -> RANKCOL
             raise NotImplementedError(
                 "Pipeline support for 'with_scores' requires conversion step "
                 "to LISTROW_RANKCOL format expected by SRA. Use 'with_items_lists' "
@@ -2272,7 +2347,7 @@ class RankPipeline:
         epsilon: float | np.ndarray = 0.0,
         metric: Literal["sd", "mad"] = "sd",
         B: int = 1,
-        # nitems is now inferred/handled internally by _prepare_data
+        nitems: Optional[int] = None,
     ) -> "RankPipeline":
         """
         Compute SRA for the prepared ranked data.
@@ -2292,7 +2367,7 @@ class RankPipeline:
             For method chaining.
         """
         if not self._generated:
-            self._prepare_data()  # Ensure ranked_data and nitems are set
+            self._prepare_data(nitems)  # Ensure ranked_data and nitems are set
 
         if self.ranked_data is None or self.nitems is None:
             # Should have been caught by _prepare_data, but double-check
@@ -2311,7 +2386,7 @@ class RankPipeline:
     def random_list_sra(
         self,
         n_permutations: int = 100,
-        # nitems is inferred/handled internally by _prepare_data
+        nitems: Optional[int] = None,
     ) -> "RankPipeline":
         """
         Generate null distribution for the prepared ranked data. Uses SRA parameters
@@ -2328,7 +2403,7 @@ class RankPipeline:
             For method chaining.
         """
         if not self._generated:
-            self._prepare_data()
+            self._prepare_data(nitems)
 
         if self.ranked_data is None or self.nitems is None:
             raise ValueError(
