@@ -249,7 +249,7 @@ wheels = [
 
 [[package]]
 name = "sr-agreement"
-version = "0.0.3"
+version = "0.0.7"
 source = { editable = "." }
 dependencies = [
     { name = "ma-utils" },
