@@ -192,7 +192,7 @@ class TestConfig:
 
     Parameters
     ----------
-    style : str, default="l2"
+    style : str, default="max"
         Method to aggregate differences.
         Must be one of ["l2", "max"].
     window : int, default=1
@@ -203,12 +203,19 @@ class TestConfig:
     threshold_quantile : float, default=0.90
         Quantile to use as threshold for GPD fitting.
         Must be between 0 and 1.
+    tails : str, default="one-tailed"
+        For comparison tests, specifies if the test is one-tailed
+        (e.g., is sra1's deviation significantly GREATER than sra2's deviation)
+        or two-tailed (is sra1's deviation significantly DIFFERENT from sra2's deviation).
+        Applies only to compare_sra/SRACompare.
+        Must be one of ["one-tailed", "two-tailed"].
     """
 
     style: Literal["l2", "max"] = "max"
     window: int = 1
     use_gpd: bool = False
     threshold_quantile: float = 0.90
+    sra_comparison_tails: Literal["one-tailed", "two-tailed"] = "one-tailed"
 
     def __post_init__(self):
         # Validate style
@@ -225,6 +232,12 @@ class TestConfig:
         if not 0 < self.threshold_quantile < 1:
             raise ValueError(
                 f"Threshold quantile must be between 0 and 1, got {self.threshold_quantile}"
+            )
+
+        # Validate tails
+        if self.sra_comparison_tails not in ["one-tailed", "two-tailed"]:
+            raise ValueError(
+                f"Tails must be 'one-tailed' or 'two-tailed', got {self.sra_comparison_tails}"
             )
 
 
@@ -1341,7 +1354,7 @@ def compare_sra(
         Null distribution for second curve (2D array, depths x permutations).
         Must have the same number of permutations as null1.
     config : TestConfig
-        Configuration for the test (style, window).
+        Configuration for the test (style, window, tails).
 
     Returns
     -------
@@ -1385,14 +1398,14 @@ def compare_sra(
         sra1_smooth = smooth_sra_window(sra1, config.window)
         sra2_smooth = smooth_sra_window(sra2, config.window)
 
-        if current_n_jobs == 1:  # Serial smoothing
+        if current_n_jobs == 1:
             null1_smooth = np.apply_along_axis(
                 lambda n: smooth_sra_window(n, config.window), 0, null1
             )
             null2_smooth = np.apply_along_axis(
                 lambda n: smooth_sra_window(n, config.window), 0, null2
             )
-        else:  # Parallel smoothing
+        else:
             smoothed_cols1 = Parallel(n_jobs=current_n_jobs, verbose=0)(
                 delayed(_worker_smooth_col_joblib)(
                     col_data=null1[:, i],
@@ -1454,9 +1467,16 @@ def compare_sra(
         )
         p_value = np.nan
     else:
-        p_value = (np.sum(valid_T_null_diff >= T_obs) + 1) / (
-            len(valid_T_null_diff) + 1
-        )
+        if config.sra_comparison_tails == "one-tailed":
+            p_value = (np.sum(valid_T_null_diff >= T_obs) + 1) / (
+                len(valid_T_null_diff) + 1
+            )
+        elif config.sra_comparison_tails == "two-tailed":
+            p_value = (
+                np.sum(np.abs(valid_T_null_diff) >= np.abs(T_obs)) + 1
+            ) / (len(valid_T_null_diff) + 1)
+        else:  # Should be caught by TestConfig validation
+            raise ValueError(f"Invalid tails: {config.sra_comparison_tails}")
 
     return ComparisonResult(
         p_value=p_value,
@@ -2158,17 +2178,26 @@ class SRACompare(BaseEstimator):
         Method to aggregate differences for comparison statistic.
     window : int, default=1
         Size of smoothing window. Use 1 for no smoothing.
+    tails : {'one-tailed', 'two-tailed'}, default='one-tailed'
+        Specifies the tails of the comparison test.
+        "one-tailed": tests if sra1's deviation > sra2's deviation.
+        "two-tailed": tests if sra1's deviation != sra2's deviation.
+    n_jobs : int, default=1
+        Number of parallel jobs to use.
     """
 
     def __init__(
         self,
         style: Literal["l2", "max"] = "max",
         window: int = 1,
+        tails: Literal["one-tailed", "two-tailed"] = "one-tailed",
         n_jobs: int = 1,
     ):
         super().__init__()
         # GPD not typically used in comparison context
-        self.config = TestConfig(style=style, window=window, use_gpd=False)
+        self.config = TestConfig(
+            style=style, window=window, use_gpd=False, sra_comparison_tails=tails
+        )
         self.n_jobs = n_jobs
         self.result_ = None
 
@@ -2227,7 +2256,6 @@ class SRACompare(BaseEstimator):
         else:
             raise TypeError("null2 must be RandomListSRAResult or array-like.")
 
-        # Basic validation done within compare_sra function
         self.result_ = compare_sra(
             sra1_values,
             sra2_values,
@@ -2241,7 +2269,6 @@ class SRACompare(BaseEstimator):
 
     @require_generated
     def get_result(self) -> ComparisonResult:
-        """Get the comparison result."""
         if self.result_ is None:
             raise ValueError("Comparison not performed. Call 'generate' first.")
         return self.result_
@@ -2693,7 +2720,7 @@ def example_usage():
     Demonstrate example usage of the SuperRanker package, utilizing 12 workers.
     """
     N_JOBS_TO_USE = 12  # Define the number of workers
-    N_PERMUTATIONS_EXAMPLE = 50000
+    N_PERMUTATIONS_EXAMPLE = 10000
     N_PERMUTATIONS_COMPARISON = (
         50000  # Fewer for the comparison example for speed
     )
@@ -2754,13 +2781,11 @@ def example_usage():
         ).generate(ranks_numeric, nitems=n_items_in_example)
         null_result = null_estimator.get_result()
 
-        test_config = TestConfig(
-            style="max", use_gpd=False
-        )  # TestConfig doesn't take n_jobs directly
+        test_config = TestConfig(style="max", use_gpd=False)
         test_estimator = SRATest(
             style=test_config.style,
             use_gpd=test_config.use_gpd,
-            n_jobs=N_JOBS_TO_USE,  # Use n_jobs in SRATest constructor
+            n_jobs=N_JOBS_TO_USE,
         ).generate(sra_result, null_result)
         test_result = test_estimator.get_result()
 
@@ -2936,7 +2961,7 @@ def example_usage():
 
         # Use n_jobs in SRACompare constructor
         compare_estimator = SRACompare(
-            style="max", n_jobs=N_JOBS_TO_USE
+            style="max", tails="two-tailed", n_jobs=N_JOBS_TO_USE
         ).generate(sra1, sra2, null1, null2)
         compare_result = compare_estimator.get_result()
 
