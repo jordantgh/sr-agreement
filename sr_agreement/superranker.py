@@ -14,6 +14,7 @@ from scipy.stats import genpareto, rankdata
 from enum import Enum
 import pandas as pd
 import collections.abc
+from joblib import Parallel, delayed
 
 # Import necessary components from the adapter module
 try:
@@ -44,6 +45,78 @@ except ImportError:
 
     def convert_rank_data(*args, **kwargs) -> RankDataAdapter:
         raise NotImplementedError("rank_array_adapter module is required.")
+
+
+def _worker_rls_joblib(
+    num_lists: int,
+    final_nitems: int,
+    real_lengths: np.ndarray,
+    all_possible_ids: np.ndarray,
+    sra_config: "SRAConfig",
+    compute_sra_func: callable,
+    rng_entropy: int,
+) -> np.ndarray:
+    """
+    Build ONE permuted data set and return its SRA curve.
+
+    A fresh independent Generator is created from the supplied entropy so that
+    every worker is reproducible and independent of the global RNG.
+    """
+    rng = np.random.default_rng(rng_entropy)
+
+    # build a (num_lists × n_items) matrix filled with NaN
+    current_obj_for_rep = np.full(
+        (num_lists, final_nitems), np.nan, dtype=float
+    )
+
+    for row_idx, nn in enumerate(real_lengths):
+        nn = min(nn, final_nitems)
+        if nn:
+            sample = rng.choice(all_possible_ids, size=nn, replace=False)
+            current_obj_for_rep[row_idx, :nn] = sample
+
+    sra_curve = compute_sra_func(
+        current_obj_for_rep,
+        sra_config,
+        nitems=final_nitems,
+        rng=rng,
+    ).values
+    return sra_curve
+
+
+def _worker_gnd_joblib(
+    current_col_from_null_matrix: np.ndarray,
+    n_depths: int,
+    colsums: np.ndarray,
+    valid_counts: np.ndarray,
+    aggregator_style: str,
+    aggregator_func: callable,
+) -> float:
+    """
+    Worker function for a single column in _generate_null_distribution using joblib.
+    """
+    if np.all(np.isnan(current_col_from_null_matrix)):
+        return np.nan
+
+    loo_sum = colsums - np.nan_to_num(current_col_from_null_matrix)
+    loo_count = valid_counts - (~np.isnan(current_col_from_null_matrix)).astype(
+        int
+    )
+
+    loo_mean = np.full(n_depths, np.nan)
+    valid_mask = loo_count > 0
+    if np.any(valid_mask):
+        loo_mean[valid_mask] = loo_sum[valid_mask] / loo_count[valid_mask]
+
+    diffs = np.abs(current_col_from_null_matrix - loo_mean)
+    return aggregator_func(diffs, aggregator_style)
+
+
+def _worker_smooth_col_joblib(
+    col_data: np.ndarray, window_size: int, smooth_sra_window_func: callable
+) -> np.ndarray:
+    """Worker function to smooth a single column using joblib."""
+    return smooth_sra_window_func(col_data, window_size)
 
 
 def require_generated(method):
@@ -627,6 +700,7 @@ def _calculate_gpd_pvalue(
 def _generate_null_distribution(
     null_matrix: np.ndarray,
     aggregator_style: str,
+    n_jobs: int = 1,
 ) -> np.ndarray:
     """
     Generate null distribution of test statistics using leave-one-out means.
@@ -651,39 +725,39 @@ def _generate_null_distribution(
         )
         return np.full(B, np.nan)
 
-    # Calculate sum across permutations for each depth, ignoring NaNs
+    current_n_jobs = n_jobs if n_jobs is not None and n_jobs != 0 else 1
+
     colsums = np.nansum(null_matrix, axis=1)
-    # Count non-NaN values for each depth
     valid_counts = np.sum(~np.isnan(null_matrix), axis=1)
 
-    T_null = np.full(B, np.nan)  # Initialize with NaN
+    T_null_list = []
 
-    for i in range(B):
-        current_col = null_matrix[:, i]
-        # Skip if current column is all NaN
-        if np.all(np.isnan(current_col)):
-            continue
+    if current_n_jobs == 1:
+        for i in range(B):
+            T_null_list.append(
+                _worker_gnd_joblib(
+                    current_col_from_null_matrix=null_matrix[:, i],
+                    n_depths=n_depths,
+                    colsums=colsums,
+                    valid_counts=valid_counts,
+                    aggregator_style=aggregator_style,
+                    aggregator_func=_aggregator,
+                )
+            )
+    else:
+        T_null_list = Parallel(n_jobs=current_n_jobs, verbose=0)(
+            delayed(_worker_gnd_joblib)(
+                current_col_from_null_matrix=null_matrix[:, i],
+                n_depths=n_depths,
+                colsums=colsums,
+                valid_counts=valid_counts,
+                aggregator_style=aggregator_style,
+                aggregator_func=_aggregator,
+            )
+            for i in range(B)
+        )
 
-        # Calculate leave-one-out sum and count
-        loo_sum = colsums - np.nan_to_num(
-            current_col
-        )  # Treat NaN in current_col as 0 for subtraction
-        loo_count = valid_counts - (~np.isnan(current_col)).astype(int)
-
-        # Calculate leave-one-out mean, avoiding division by zero
-        loo_mean = np.full(n_depths, np.nan)
-        valid_mask = loo_count > 0
-        loo_mean[valid_mask] = loo_sum[valid_mask] / loo_count[valid_mask]
-
-        # Calculate difference, ignoring NaNs in either current_col or loo_mean
-        diffs = np.abs(current_col - loo_mean)  # NaNs will propagate
-
-        # Aggregate valid differences
-        T_null[i] = _aggregator(
-            diffs, aggregator_style
-        )  # _aggregator handles NaNs
-
-    return T_null
+    return np.array(T_null_list)
 
 
 ###################
@@ -702,7 +776,10 @@ def _nanmad(x: np.ndarray) -> float:
 
 
 def compute_sra(
-    ranked_lists: np.ndarray, config: SRAConfig, nitems: Optional[int] = None
+    ranked_lists: np.ndarray,
+    config: SRAConfig,
+    nitems: Optional[int] = None,
+    rng: Optional[np.random.Generator] = None,
 ) -> SRAResult:
     """
     Compute the Sequential Rank Agreement (SRA) for a set of ranked lists.
@@ -733,6 +810,9 @@ def compute_sra(
         ranked_lists = np.array(ranked_lists)
     if not np.issubdtype(ranked_lists.dtype, np.number):
         raise ValueError("Input ranked_lists must be numeric.")
+
+    if rng is None:
+        rng = np.random.default_rng()
 
     ranked_lists = ranked_lists.astype(float)  # Work with floats internally
     num_lists, list_length = ranked_lists.shape
@@ -830,7 +910,7 @@ def compute_sra(
             )
 
             if missing_items.size > 0:
-                np.random.shuffle(missing_items)
+                rng.shuffle(missing_items)
 
             new_list = list_i.copy()
             # Impute missing values
@@ -961,6 +1041,7 @@ def random_list_sra(
     config: SRAConfig,
     n_permutations: int = 100,
     nitems: Optional[int] = None,
+    n_jobs: int = 1,
 ) -> RandomListSRAResult:
     """
     Generate null distribution for SRA by permuting lists, respecting original list lengths.
@@ -986,14 +1067,12 @@ def random_list_sra(
 
     if not isinstance(ranked_lists, np.ndarray):
         try:
-            # Convert list of lists, handling varying lengths by finding max
             if isinstance(ranked_lists, list) and ranked_lists:
                 max_len = (
                     max(len(sublist) for sublist in ranked_lists)
                     if ranked_lists
                     else 0
                 )
-
                 padded_lists = []
                 for sublist in ranked_lists:
                     padded_sublist = list(sublist) + [np.nan] * (
@@ -1008,13 +1087,7 @@ def random_list_sra(
                 "Input ranked_lists must be array-like and numeric or list of numeric lists."
             )
     else:
-        ranked_lists_arr = ranked_lists
-
-    if not np.issubdtype(ranked_lists_arr.dtype, np.number):
-        try:
-            ranked_lists_arr = ranked_lists_arr.astype(float)
-        except ValueError:
-            raise TypeError("Input ranked_lists NumPy array must be numeric.")
+        ranked_lists_arr = ranked_lists.astype(float)  # Ensure float
 
     if ranked_lists_arr.ndim != 2:
         if (
@@ -1022,8 +1095,7 @@ def random_list_sra(
             and isinstance(ranked_lists, list)
             and not ranked_lists
         ):
-            num_lists = 0
-            original_list_length = 0
+            num_lists, original_list_length = 0, 0
         else:
             raise ValueError("Input ranked_lists must be 2D.")
     else:
@@ -1031,7 +1103,6 @@ def random_list_sra(
 
     real_lengths = np.sum(~np.isnan(ranked_lists_arr), axis=1).astype(int)
 
-    # Determine nitems (total universe size)
     final_nitems = nitems
     if final_nitems is None:
         present_ids = ranked_lists_arr[~np.isnan(ranked_lists_arr)]
@@ -1040,76 +1111,69 @@ def random_list_sra(
             final_nitems = max(max_id, original_list_length, 1)
         else:
             final_nitems = max(original_list_length, 1)
-
         if nitems is None and final_nitems > original_list_length:
             warnings.warn(
                 f"Inferred nitems={final_nitems} from max item ID found, "
                 f"which is greater than original list_length={original_list_length}. Using this for permutations."
             )
-        nitems = final_nitems
-    elif not isinstance(nitems, int) or nitems <= 0:
+    elif (
+        not isinstance(final_nitems, int) or final_nitems <= 0
+    ):  # nitems was passed
         raise ValueError("nitems must be a positive integer.")
-    else:
-        final_nitems = nitems
+    # final_nitems is now set
 
-    processed_ranked_lists = ranked_lists_arr
-    current_list_length = original_list_length
+    # Note: processed_ranked_lists from original code is not directly used by the worker
+    # as worker reconstructs permutations from scratch using all_possible_ids.
 
-    if current_list_length < final_nitems:
-        pad_width = final_nitems - current_list_length
-        # Ensure padding uses float NaN
-        pad = np.full((num_lists, pad_width), np.nan, dtype=float)
-        processed_ranked_lists = np.concatenate(
-            [processed_ranked_lists, pad], axis=1
-        )
-        current_list_length = final_nitems
-    elif current_list_length > final_nitems:
-        warnings.warn(
-            f"Input list_length ({current_list_length}) > specified nitems ({final_nitems}). Truncating lists for null generation."
-        )
-        processed_ranked_lists = processed_ranked_lists[:, :final_nitems]
-        current_list_length = final_nitems
-
-    # Pre-generate random partial-permutations for each list based on its length
-    sample_list = []
     all_possible_ids = np.arange(1, final_nitems + 1)
-
-    for nn in real_lengths:
-        # nn is the number of non-NaN items originally in this list
-        # Generate n_permutations permutations of [1..final_nitems], each truncated to size nn
-        # Ensure nn doesn't exceed number of unique IDs if nitems is small
-        size_to_sample = min(nn, final_nitems)
-        if size_to_sample < 0:
-            size_to_sample = 0  # Handle empty list case
-
-        row_samples = [
-            np.random.choice(
-                all_possible_ids, size=size_to_sample, replace=False
-            )
-            for _ in range(n_permutations)
-        ]
-        sample_list.append(row_samples)
-
-    # Now build each random replicate and compute SRA
     sra_results = []
-    for i in range(n_permutations):
-        # Assemble a new matrix for this permutation replicate.
-        # It needs the shape expected by compute_sra (num_lists, final_nitems)
-        current_obj = np.full((num_lists, final_nitems), np.nan, dtype=float)
 
-        for row_idx in range(num_lists):
-            nn = min(real_lengths[row_idx], final_nitems)
-            if nn > 0:
-                # Place the 'nn' sampled items into the first 'nn' columns
-                current_obj[row_idx, :nn] = sample_list[row_idx][i]
+    # Actual number of jobs for joblib (joblib handles n_jobs=-1 itself)
+    # If n_jobs is None or 0, treat as 1 (serial)
+    current_n_jobs = n_jobs if n_jobs is not None and n_jobs != 0 else 1
 
-        # Compute SRA on the assembled matrix for this replicate.
-        sra_curve = compute_sra(current_obj, config, nitems=final_nitems).values
-        sra_results.append(sra_curve)
+    if current_n_jobs == 1:
+        # Ensure reproducibility for serial path if a global seed was set before calling this
+        # or match the seeding strategy of the parallel path for consistency.
+        master_seed_seq = np.random.SeedSequence()
+        worker_seeds_entropy = [
+            s.generate_state(1)[0]  # <- unique 32-bit integer
+            for s in master_seed_seq.spawn(n_permutations)
+        ]
 
-    # Combine into a distribution of shape (nitems, n_permutations)
-    # NB. len(sra_curve) (& rows of null_distribution) will be final_nitems.
-    if not sra_results:  # Handle case of 0 permutations or 0 lists
+        for i in range(n_permutations):
+            sra_results.append(
+                _worker_rls_joblib(
+                    num_lists=num_lists,
+                    final_nitems=final_nitems,
+                    real_lengths=real_lengths,
+                    all_possible_ids=all_possible_ids,
+                    sra_config=config,
+                    compute_sra_func=compute_sra,
+                    rng_entropy=worker_seeds_entropy[i],
+                )
+            )
+    else:
+        master_seed_seq = np.random.SeedSequence()
+        worker_seeds_entropy = [
+            s.generate_state(1)[0]  # unique 32-bit integer
+            for s in master_seed_seq.spawn(n_permutations)
+        ]
+
+        sra_results = Parallel(n_jobs=current_n_jobs, verbose=0)(
+            delayed(_worker_rls_joblib)(
+                num_lists=num_lists,
+                final_nitems=final_nitems,
+                real_lengths=real_lengths,
+                all_possible_ids=all_possible_ids,
+                sra_config=config,
+                compute_sra_func=compute_sra,
+                rng_entropy=worker_seeds_entropy[i],
+            )
+            for i in range(n_permutations)
+        )
+
+    if not sra_results:
         null_distribution = np.empty((final_nitems, 0), dtype=float)
     else:
         null_distribution = np.column_stack(sra_results)
@@ -1122,7 +1186,10 @@ def random_list_sra(
 
 
 def test_sra(
-    observed_sra: np.ndarray, null_distribution: np.ndarray, config: TestConfig
+    observed_sra: np.ndarray,
+    null_distribution: np.ndarray,
+    config: TestConfig,
+    n_jobs: int = 1,
 ) -> TestResult:
     """
     Test observed SRA values against null distribution.
@@ -1153,13 +1220,35 @@ def test_sra(
             "observed_sra and null_distribution must have the same number of depths."
         )
 
+    current_n_jobs = n_jobs if n_jobs is not None and n_jobs != 0 else 1
+    null_distribution_smooth = null_distribution
+
     # Apply smoothing if requested
     if config.window > 1:
         observed_sra_smooth = smooth_sra_window(observed_sra, config.window)
-        # Apply smoothing to each column (permutation) of the null distribution
-        null_distribution_smooth = np.apply_along_axis(
-            lambda n: smooth_sra_window(n, config.window), 0, null_distribution
-        )
+
+        if current_n_jobs == 1:
+            null_distribution_smooth = np.apply_along_axis(
+                lambda n: smooth_sra_window(n, config.window),
+                0,
+                null_distribution,
+            )
+        else:
+            smoothed_cols = Parallel(n_jobs=current_n_jobs, verbose=0)(
+                delayed(_worker_smooth_col_joblib)(
+                    col_data=null_distribution[:, i],
+                    window_size=config.window,
+                    smooth_sra_window_func=smooth_sra_window,
+                )
+                for i in range(null_distribution.shape[1])
+            )
+            if smoothed_cols:
+                null_distribution_smooth = np.column_stack(smoothed_cols)
+            else:
+                null_distribution_smooth = np.empty(
+                    (null_distribution.shape[0], 0)
+                )
+
     else:
         observed_sra_smooth = observed_sra
         null_distribution_smooth = null_distribution
@@ -1167,15 +1256,13 @@ def test_sra(
     # Compute test statistic for observed data
     # Calculate mean of the null distribution *per depth*, ignoring NaNs
     mean_null_sra = np.nanmean(null_distribution_smooth, axis=1)
-    diffs_obs = np.abs(
-        observed_sra_smooth - mean_null_sra
-    )  # NaNs may propagate if mean_null_sra is NaN
-    T_obs = _aggregator(
-        diffs_obs, style=config.style
-    )  # _aggregator handles NaNs in diffs_obs
+    diffs_obs = np.abs(observed_sra_smooth - mean_null_sra)
+    T_obs = _aggregator(diffs_obs, style=config.style)
 
     # Generate null distribution of test statistics
-    T_null = _generate_null_distribution(null_distribution_smooth, config.style)
+    T_null = _generate_null_distribution(
+        null_distribution_smooth, config.style, n_jobs=current_n_jobs
+    )
 
     # Compute empirical p-value (handle potential NaNs in T_null)
     # Compare T_obs with valid (non-NaN) values in T_null
@@ -1223,7 +1310,7 @@ def test_sra(
     return TestResult(
         p_value_empirical=p_value_empirical,
         test_statistic=T_obs,
-        null_statistics=T_null,  # Return original T_null including potential NaNs
+        null_statistics=T_null,
         config=config,
         p_value_gpd=p_value_gpd,
         gpd_fit=gpd_fit,
@@ -1236,6 +1323,7 @@ def compare_sra(
     null1: np.ndarray,
     null2: np.ndarray,
     config: TestConfig,
+    n_jobs: int = 1,
 ) -> ComparisonResult:
     """
     Compare two SRA curves based on their deviation from their respective nulls,
@@ -1266,10 +1354,8 @@ def compare_sra(
         If inputs have incompatible shapes or null distributions have different
         numbers of permutations.
     """
-    sra1 = np.asarray(sra1)
-    sra2 = np.asarray(sra2)
-    null1 = np.asarray(null1)
-    null2 = np.asarray(null2)
+    sra1, sra2 = np.asarray(sra1), np.asarray(sra2)
+    null1, null2 = np.asarray(null1), np.asarray(null2)
 
     if sra1.ndim != 1 or sra2.ndim != 1:
         raise ValueError("SRA curves must be 1D arrays.")
@@ -1290,15 +1376,48 @@ def compare_sra(
     if null1.shape[1] == 0:
         raise ValueError("Null distributions cannot have zero permutations.")
 
+    current_n_jobs = n_jobs if n_jobs is not None and n_jobs != 0 else 1
+
+    sra1_smooth, sra2_smooth = sra1, sra2
+    null1_smooth, null2_smooth = null1, null2
+
     if config.window > 1:
         sra1_smooth = smooth_sra_window(sra1, config.window)
         sra2_smooth = smooth_sra_window(sra2, config.window)
-        null1_smooth = np.apply_along_axis(
-            lambda n: smooth_sra_window(n, config.window), 0, null1
-        )
-        null2_smooth = np.apply_along_axis(
-            lambda n: smooth_sra_window(n, config.window), 0, null2
-        )
+
+        if current_n_jobs == 1:  # Serial smoothing
+            null1_smooth = np.apply_along_axis(
+                lambda n: smooth_sra_window(n, config.window), 0, null1
+            )
+            null2_smooth = np.apply_along_axis(
+                lambda n: smooth_sra_window(n, config.window), 0, null2
+            )
+        else:  # Parallel smoothing
+            smoothed_cols1 = Parallel(n_jobs=current_n_jobs, verbose=0)(
+                delayed(_worker_smooth_col_joblib)(
+                    col_data=null1[:, i],
+                    window_size=config.window,
+                    smooth_sra_window_func=smooth_sra_window,
+                )
+                for i in range(null1.shape[1])
+            )
+            if smoothed_cols1:
+                null1_smooth = np.column_stack(smoothed_cols1)
+            else:
+                null1_smooth = np.empty((null1.shape[0], 0))
+
+            smoothed_cols2 = Parallel(n_jobs=current_n_jobs, verbose=0)(
+                delayed(_worker_smooth_col_joblib)(
+                    col_data=null2[:, i],
+                    window_size=config.window,
+                    smooth_sra_window_func=smooth_sra_window,
+                )
+                for i in range(null2.shape[1])
+            )
+            if smoothed_cols2:
+                null2_smooth = np.column_stack(smoothed_cols2)
+            else:
+                null2_smooth = np.empty((null2.shape[0], 0))
     else:
         sra1_smooth = sra1
         sra2_smooth = sra2
@@ -1307,17 +1426,18 @@ def compare_sra(
 
     mean_null1 = np.nanmean(null1_smooth, axis=1)
     mean_null2 = np.nanmean(null2_smooth, axis=1)
-
     diffs_obs1 = np.abs(sra1_smooth - mean_null1)
     diffs_obs2 = np.abs(sra2_smooth - mean_null2)
-
     T_obs1 = _aggregator(diffs_obs1, config.style)
     T_obs2 = _aggregator(diffs_obs2, config.style)
-
     T_obs = T_obs1 - T_obs2
 
-    T_null1 = _generate_null_distribution(null1_smooth, config.style)
-    T_null2 = _generate_null_distribution(null2_smooth, config.style)
+    T_null1 = _generate_null_distribution(
+        null1_smooth, config.style, n_jobs=current_n_jobs
+    )
+    T_null2 = _generate_null_distribution(
+        null2_smooth, config.style, n_jobs=current_n_jobs
+    )
 
     T_null_diff = T_null1 - T_null2
 
@@ -1818,12 +1938,14 @@ class RandomListSRA(BaseEstimator):
         metric: Literal["sd", "mad"] = "sd",
         B: int = 1,
         n_permutations: int = 100,
+        n_jobs: int = 1,
     ):
         super().__init__()
         if n_permutations < 1:
             raise ValueError("n_permutations must be at least 1.")
         self.config = SRAConfig(epsilon=epsilon, metric=metric, B=B)
         self.n_permutations = n_permutations
+        self.n_jobs = n_jobs
         self.result_ = None
 
     def generate(
@@ -1846,9 +1968,9 @@ class RandomListSRA(BaseEstimator):
         self : object
             Fitted estimator.
         """
-        X = self._validate_input(X)  # Ensures X is 2D numeric array
+        X = self._validate_input(X)
         self.result_ = random_list_sra(
-            X, self.config, self.n_permutations, nitems
+            X, self.config, self.n_permutations, nitems, n_jobs=self.n_jobs
         )
         self.fitted_ = True
         return self
@@ -1945,6 +2067,7 @@ class SRATest(BaseEstimator):
         window: int = 1,
         use_gpd: bool = False,
         threshold_quantile: float = 0.90,
+        n_jobs: int = 1,
     ):
         super().__init__()
         self.config = TestConfig(
@@ -1953,6 +2076,7 @@ class SRATest(BaseEstimator):
             use_gpd=use_gpd,
             threshold_quantile=threshold_quantile,
         )
+        self.n_jobs = n_jobs
         self.result_ = None
 
     def generate(
@@ -2005,7 +2129,9 @@ class SRATest(BaseEstimator):
                 "observed_sra and null_dist must have same number of depths (first dimension)."
             )
 
-        self.result_ = test_sra(observed_values, null_values, self.config)
+        self.result_ = test_sra(
+            observed_values, null_values, self.config, self.n_jobs
+        )
         self.fitted_ = True
         return self
 
@@ -2034,10 +2160,16 @@ class SRACompare(BaseEstimator):
         Size of smoothing window. Use 1 for no smoothing.
     """
 
-    def __init__(self, style: Literal["l2", "max"] = "max", window: int = 1):
+    def __init__(
+        self,
+        style: Literal["l2", "max"] = "max",
+        window: int = 1,
+        n_jobs: int = 1,
+    ):
         super().__init__()
         # GPD not typically used in comparison context
         self.config = TestConfig(style=style, window=window, use_gpd=False)
+        self.n_jobs = n_jobs
         self.result_ = None
 
     def generate(
@@ -2097,7 +2229,12 @@ class SRACompare(BaseEstimator):
 
         # Basic validation done within compare_sra function
         self.result_ = compare_sra(
-            sra1_values, sra2_values, null1_values, null2_values, self.config
+            sra1_values,
+            sra2_values,
+            null1_values,
+            null2_values,
+            self.config,
+            self.n_jobs,
         )
         self.fitted_ = True
         return self
@@ -2385,8 +2522,9 @@ class RankPipeline:
 
     def random_list_sra(
         self,
-        n_permutations: int = 100,
+        n_permutations: int = 1000,
         nitems: Optional[int] = None,
+        n_jobs: int = 1,
     ) -> "RankPipeline":
         """
         Generate null distribution for the prepared ranked data. Uses SRA parameters
@@ -2394,7 +2532,7 @@ class RankPipeline:
 
         Parameters
         ----------
-        n_permutations : int, default=100
+        n_permutations : int, default=1000
             Number of permutations to generate.
 
         Returns
@@ -2422,6 +2560,7 @@ class RankPipeline:
             metric=sra_conf.metric,
             B=sra_conf.B,
             n_permutations=n_permutations,
+            n_jobs=n_jobs,
         ).generate(self.ranked_data, nitems=self.nitems)
 
         return self
@@ -2432,6 +2571,7 @@ class RankPipeline:
         window: int = 1,
         use_gpd: bool = False,
         threshold_quantile: float = 0.90,
+        n_jobs: int = 1,
     ) -> "RankPipeline":
         """
         Test significance of observed SRA against null distribution.
@@ -2475,6 +2615,7 @@ class RankPipeline:
             window=window,
             use_gpd=use_gpd,
             threshold_quantile=threshold_quantile,
+            n_jobs=n_jobs,
         ).generate(self.sra.get_result(), self.null_dist.get_result())
 
         return self
@@ -2549,8 +2690,16 @@ class RankPipeline:
 # (Keep example_usage function as is, it doesn't need modification for the internal fixes)
 def example_usage():
     """
-    Demonstrate example usage of the SuperRanker package.
+    Demonstrate example usage of the SuperRanker package, utilizing 12 workers.
     """
+    N_JOBS_TO_USE = 12  # Define the number of workers
+    N_PERMUTATIONS_EXAMPLE = 50000
+    N_PERMUTATIONS_COMPARISON = (
+        50000  # Fewer for the comparison example for speed
+    )
+
+    print(f"--- Running examples with n_jobs = {N_JOBS_TO_USE} ---")
+
     # Sample ranked lists with numeric IDs (1-based)
     ranks_numeric = np.array(
         [
@@ -2561,15 +2710,20 @@ def example_usage():
     )
 
     # Using the Pipeline API with pre-defined numeric ranks
-    print("Using Pipeline API with numeric ranks:")
-    # Explicitly state nitems, though it could be inferred correctly here
-    n_items_in_example = 8
+    print("\nUsing Pipeline API with numeric ranks:")
+    n_items_in_example = (
+        8  # This can often be inferred, but good to be explicit
+    )
     results_numeric = (
         RankPipeline()
         .with_ranked_data(ranks_numeric)
-        .compute_sra(epsilon=0.0, metric="sd", B=1)  # nitems handled internally
-        .random_list_sra(n_permutations=1000)  # nitems handled internally
-        .test_significance(style="max", window=1, use_gpd=False)
+        .compute_sra(epsilon=0.0, metric="sd", B=1)
+        .random_list_sra(
+            n_permutations=N_PERMUTATIONS_EXAMPLE, n_jobs=N_JOBS_TO_USE
+        )  # Use n_jobs
+        .test_significance(
+            style="max", window=1, use_gpd=False, n_jobs=N_JOBS_TO_USE
+        )  # Use n_jobs
         .build()
     )
 
@@ -2583,13 +2737,11 @@ def example_usage():
         print(
             f"Significant (p<0.05): {results_numeric.get('significant_05', 'N/A')}"
         )
-        # print(f"When Included (first 5): {results_numeric.get('when_included', [])[:5]}")
 
     # Using the direct API (more verbose, shows underlying steps)
     print("\nUsing Direct API:")
     try:
         sra_config = SRAConfig(epsilon=0.0, metric="sd", B=1)
-        # Generate requires data and optionally nitems
         sra_estimator = SRA().generate(ranks_numeric, nitems=n_items_in_example)
         sra_result = sra_estimator.get_result()
 
@@ -2597,24 +2749,29 @@ def example_usage():
             epsilon=sra_config.epsilon,
             metric=sra_config.metric,
             B=sra_config.B,
-            n_permutations=1000,
-        ).generate(
-            ranks_numeric, nitems=n_items_in_example
-        )  # Pass data structure and nitems
+            n_permutations=N_PERMUTATIONS_EXAMPLE,
+            n_jobs=N_JOBS_TO_USE,  # Use n_jobs
+        ).generate(ranks_numeric, nitems=n_items_in_example)
         null_result = null_estimator.get_result()
 
-        test_config = TestConfig(style="max", use_gpd=False)
+        test_config = TestConfig(
+            style="max", use_gpd=False
+        )  # TestConfig doesn't take n_jobs directly
         test_estimator = SRATest(
-            style=test_config.style, use_gpd=test_config.use_gpd
-        ).generate(sra_result, null_result)  # Pass results or arrays
+            style=test_config.style,
+            use_gpd=test_config.use_gpd,
+            n_jobs=N_JOBS_TO_USE,  # Use n_jobs in SRATest constructor
+        ).generate(sra_result, null_result)
         test_result = test_estimator.get_result()
 
         print(f"Direct SRA first 5 values: {sra_result.values[:5]}")
         print(f"Direct P-value: {test_result.p_value}")
-        # print(f"Direct When Included (first 5): {sra_result.when_included[:5] if sra_result.when_included is not None else 'N/A'}")
 
     except Exception as e:
         print(f"Direct API execution failed: {e}")
+        import traceback
+
+        traceback.print_exc()
 
     # Using Item Lists (Strings)
     print("\nUsing Item Lists (Strings):")
@@ -2649,9 +2806,7 @@ def example_usage():
             "GeneG",
             "GeneF",
         ],
-        # Add a shorter list to test padding/NaN handling
         ["GeneA", "GeneC", "GeneB", None, "GeneG"],
-        # Add a list with a previously unseen item
         [
             "GeneI",
             "GeneA",
@@ -2667,11 +2822,13 @@ def example_usage():
     results_items = (
         RankPipeline()
         .with_items_lists(gene_lists)
-        .compute_sra(
-            epsilon=0.0, metric="sd", B=1
-        )  # nitems inferred from unique items
-        .random_list_sra(n_permutations=1000)  # nitems inferred
-        .test_significance(style="max", window=1, use_gpd=False)
+        .compute_sra(epsilon=0.0, metric="sd", B=1)
+        .random_list_sra(
+            n_permutations=N_PERMUTATIONS_EXAMPLE, n_jobs=N_JOBS_TO_USE
+        )  # Use n_jobs
+        .test_significance(
+            style="max", window=1, use_gpd=False, n_jobs=N_JOBS_TO_USE
+        )  # Use n_jobs
         .build()
     )
 
@@ -2688,111 +2845,109 @@ def example_usage():
 
         if "item_mapping" in results_items:
             print("\nItem mapping created:")
-            # Limit printing for brevity
             items_to_print = list(
                 results_items["item_mapping"]["item_to_id"].items()
             )[:5]
             for item, id_val in items_to_print:
                 print(f"  {item} -> ID {id_val}")
-            print(
-                f"  ... ({len(results_items['item_mapping']['item_to_id'])} total items)"
-            )
+            if len(results_items["item_mapping"]["item_to_id"]) > 5:
+                print(
+                    f"  ... ({len(results_items['item_mapping']['item_to_id'])} total items)"
+                )
 
-        # Check if when_included was calculated
         when_inc = results_items.get("when_included")
         if when_inc is not None:
             print(f"\nWhen Included (first 5 items by ID 1-5): {when_inc[:5]}")
         else:
             print("\nWhen Included data was not calculated.")
 
-    # Example with sparse/large IDs (would have failed before)
-    print("\nUsing large/sparse numeric IDs:")
-    # Item IDs are 10, 20, 5000, 60000
+    # Example with sparse/large IDs
+    print("\nUsing large/sparse numeric IDs (data prep check):")
     ranks_large_ids = np.array(
         [[10, 5000, 20, np.nan], [20, 10, 60000, 5000], [10, 20, 5000, 60000]]
     )
-    # We should provide nitems if known, otherwise it's inferred as max(ID)=60000
-    n_items_large = 60000
+    # n_items_large = 60000 # nitems will be inferred by pipeline if not given
 
-    results_large = (
+    results_large_prep = (
         RankPipeline()
         .with_ranked_data(ranks_large_ids)
-        # .compute_sra(B=1) # nitems handled internally
-        # .random_list_sra(n_permutations=100) # Reduced perms for speed
-        # .test_significance()
-        .build()  # Just build to check data prep, computation might be slow
+        # Only building to check data prep, not full computation here for speed
+        .build()
     )
 
-    if "error" in results_large:
-        print(f"Pipeline failed: {results_large['error']}")
-    elif results_large.get("ranked_data") is not None:
+    if "error" in results_large_prep:
+        print(f"Pipeline failed: {results_large_prep['error']}")
+    elif results_large_prep.get("ranked_data") is not None:
         print(
-            f"Data prepared successfully. Inferred nitems: {results_large.get('nitems')}"
+            f"Data prepared successfully. Inferred nitems: {results_large_prep.get('nitems')}"
         )
         print(
-            "Note: Full SRA computation with very large nitems can be slow/memory intensive."
+            "Note: Full SRA computation with very large nitems can be slow/memory intensive "
+            "even with parallelization for permutations. This example only checks data prep."
         )
-        # Can optionally run compute_sra etc. here if desired, e.g.:
-        # results_large = (
-        #      RankPipeline()
-        #      .with_ranked_data(ranks_large_ids)
-        #      .compute_sra(B=1).build() # Compute just SRA
+        # If you want to run the full SRA with parallelization:
+        # print("Attempting full SRA for large sparse IDs with parallelization...")
+        # results_large_full = (
+        #     RankPipeline()
+        #     .with_ranked_data(ranks_large_ids)
+        #     .compute_sra(B=1)
+        #     .random_list_sra(n_permutations=100, n_jobs=N_JOBS_TO_USE) # Reduced perms for example
+        #     .test_significance(n_jobs=N_JOBS_TO_USE)
+        #     .build()
         # )
-        # print(f"SRA Values (first 5): {results_large.get('sra_values', [])[:5]}")
+        # if "error" not in results_large_full:
+        #    print(f"SRA Values (first 5): {results_large_full.get('sra_values', [])[:5]}")
+        #    print(f"P-value: {results_large_full.get('p_value', 'N/A')}")
+        # else:
+        #    print(f"Full SRA for large IDs failed: {results_large_full['error']}")
     else:
         print("Pipeline build step failed for large IDs.")
 
     # Compare two methods example
     print("\nComparing Two Methods:")
-    # Method 1: Two lists, 8 items (IDs 1-8)
     method1_ranks = np.array(
         [[1, 2, 3, 4, 5, 6, 7, 8], [1, 2, 3, 5, 6, 7, 4, 8]]
     )
     n1 = 8
-
-    # Method 2: Two lists, different items/ranking (IDs 1-8 still)
     method2_ranks = np.array(
         [[1, 5, 3, 4, 2, 8, 7, 6], [2, 1, 5, 3, 4, 7, 8, 6]]
     )
     n2 = 8
 
     try:
-        # Calculate SRAs for both methods
         sra1 = SRA().generate(method1_ranks, nitems=n1).get_result()
         sra2 = SRA().generate(method2_ranks, nitems=n2).get_result()
 
-        # Generate null distributions (use fewer permutations for example speed)
+        # Use n_jobs in RandomListSRA constructor
         null1 = (
-            RandomListSRA(n_permutations=200)
+            RandomListSRA(
+                n_permutations=N_PERMUTATIONS_COMPARISON, n_jobs=N_JOBS_TO_USE
+            )
             .generate(method1_ranks, nitems=n1)
             .get_result()
         )
         null2 = (
-            RandomListSRA(n_permutations=200)
+            RandomListSRA(
+                n_permutations=N_PERMUTATIONS_COMPARISON, n_jobs=N_JOBS_TO_USE
+            )
             .generate(method2_ranks, nitems=n2)
             .get_result()
         )
 
-        # Compare methods
-        compare_estimator = SRACompare(style="max").generate(
-            sra1, sra2, null1, null2
-        )
+        # Use n_jobs in SRACompare constructor
+        compare_estimator = SRACompare(
+            style="max", n_jobs=N_JOBS_TO_USE
+        ).generate(sra1, sra2, null1, null2)
         compare_result = compare_estimator.get_result()
 
         print(f"Method comparison p-value: {compare_result.p_value}")
 
     except Exception as e:
         print(f"Comparison execution failed: {e}")
+        import traceback
+
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
-    # Need to wrap example usage in a function to avoid NameError
-    # for rank_array_adapter if it's not found globally
-    try:
-        from enum import Enum  # Make Enum available if adapter failed import
-
-        example_usage()
-    except ImportError as e:
-        print(f"Could not run example: {e}")
-    except Exception as e:
-        print(f"An error occurred during example usage: {e}")
+    example_usage()
