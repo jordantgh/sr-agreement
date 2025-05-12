@@ -79,7 +79,7 @@ def _worker_rls_joblib(
         current_obj_for_rep,
         sra_config,
         nitems=final_nitems,
-        rng=rng,
+        imputation_seed=rng_entropy,
     ).values
     return sra_curve
 
@@ -792,7 +792,7 @@ def compute_sra(
     ranked_lists: np.ndarray,
     config: SRAConfig,
     nitems: Optional[int] = None,
-    rng: Optional[np.random.Generator] = None,
+    imputation_seed: Optional[int] = None,
 ) -> SRAResult:
     """
     Compute the Sequential Rank Agreement (SRA) for a set of ranked lists.
@@ -824,8 +824,7 @@ def compute_sra(
     if not np.issubdtype(ranked_lists.dtype, np.number):
         raise ValueError("Input ranked_lists must be numeric.")
 
-    if rng is None:
-        rng = np.random.default_rng()
+    rng = np.random.default_rng(imputation_seed)
 
     ranked_lists = ranked_lists.astype(float)  # Work with floats internally
     num_lists, list_length = ranked_lists.shape
@@ -1055,6 +1054,7 @@ def random_list_sra(
     n_permutations: int = 100,
     nitems: Optional[int] = None,
     n_jobs: int = 1,
+    seed: Optional[int] = None,
 ) -> RandomListSRAResult:
     """
     Generate null distribution for SRA by permuting lists, respecting original list lengths.
@@ -1148,7 +1148,7 @@ def random_list_sra(
     if current_n_jobs == 1:
         # Ensure reproducibility for serial path if a global seed was set before calling this
         # or match the seeding strategy of the parallel path for consistency.
-        master_seed_seq = np.random.SeedSequence()
+        master_seed_seq = np.random.SeedSequence(entropy=seed)
         worker_seeds_entropy = [
             s.generate_state(1)[0]  # <- unique 32-bit integer
             for s in master_seed_seq.spawn(n_permutations)
@@ -1167,7 +1167,7 @@ def random_list_sra(
                 )
             )
     else:
-        master_seed_seq = np.random.SeedSequence()
+        master_seed_seq = np.random.SeedSequence(entropy=seed)
         worker_seeds_entropy = [
             s.generate_state(1)[0]  # unique 32-bit integer
             for s in master_seed_seq.spawn(n_permutations)
@@ -1870,7 +1870,12 @@ class SRA(BaseEstimator):
         self.config = SRAConfig(epsilon=epsilon, metric=metric, B=B)
         self.result_ = None
 
-    def generate(self, X: np.ndarray, nitems: Optional[int] = None) -> "SRA":
+    def generate(
+        self,
+        X: np.ndarray,
+        nitems: Optional[int] = None,
+        imputation_seed: Optional[int] = None,
+    ) -> "SRA":
         """
         Compute SRA values for ranked lists X.
 
@@ -1891,7 +1896,9 @@ class SRA(BaseEstimator):
             Fitted estimator.
         """
         X = self._validate_input(X)  # Ensures X is 2D numeric array
-        self.result_ = compute_sra(X, self.config, nitems)
+        self.result_ = compute_sra(
+            X, self.config, nitems, imputation_seed=imputation_seed
+        )
         self.fitted_ = True
         return self
 
@@ -1959,6 +1966,7 @@ class RandomListSRA(BaseEstimator):
         B: int = 1,
         n_permutations: int = 100,
         n_jobs: int = 1,
+        seed: Optional[int] = None,
     ):
         super().__init__()
         if n_permutations < 1:
@@ -1967,6 +1975,7 @@ class RandomListSRA(BaseEstimator):
         self.n_permutations = n_permutations
         self.n_jobs = n_jobs
         self.result_ = None
+        self.seed = seed
 
     def generate(
         self, X: np.ndarray, nitems: Optional[int] = None
@@ -1990,7 +1999,12 @@ class RandomListSRA(BaseEstimator):
         """
         X = self._validate_input(X)
         self.result_ = random_list_sra(
-            X, self.config, self.n_permutations, nitems, n_jobs=self.n_jobs
+            X,
+            self.config,
+            self.n_permutations,
+            nitems,
+            n_jobs=self.n_jobs,
+            seed=self.seed,
         )
         self.fitted_ = True
         return self
@@ -2196,7 +2210,10 @@ class SRACompare(BaseEstimator):
         super().__init__()
         # GPD not typically used in comparison context
         self.config = TestConfig(
-            style=style, window=window, use_gpd=False, sra_comparison_tails=tails
+            style=style,
+            window=window,
+            use_gpd=False,
+            sra_comparison_tails=tails,
         )
         self.n_jobs = n_jobs
         self.result_ = None
@@ -2512,6 +2529,7 @@ class RankPipeline:
         metric: Literal["sd", "mad"] = "sd",
         B: int = 1,
         nitems: Optional[int] = None,
+        imputation_seed: Optional[int] = None,
     ) -> "RankPipeline":
         """
         Compute SRA for the prepared ranked data.
@@ -2544,7 +2562,11 @@ class RankPipeline:
             epsilon=self.sra_config.epsilon,
             metric=self.sra_config.metric,
             B=self.sra_config.B,
-        ).generate(self.ranked_data, nitems=self.nitems)
+        ).generate(
+            self.ranked_data,
+            nitems=self.nitems,
+            imputation_seed=imputation_seed,
+        )
         return self
 
     def random_list_sra(
@@ -2552,6 +2574,7 @@ class RankPipeline:
         n_permutations: int = 1000,
         nitems: Optional[int] = None,
         n_jobs: int = 1,
+        seed: Optional[int] = None,
     ) -> "RankPipeline":
         """
         Generate null distribution for the prepared ranked data. Uses SRA parameters
@@ -2588,6 +2611,7 @@ class RankPipeline:
             B=sra_conf.B,
             n_permutations=n_permutations,
             n_jobs=n_jobs,
+            seed=seed,
         ).generate(self.ranked_data, nitems=self.nitems)
 
         return self
@@ -2720,10 +2744,18 @@ def example_usage():
     Demonstrate example usage of the SuperRanker package, utilizing 12 workers.
     """
     N_JOBS_TO_USE = 12  # Define the number of workers
-    N_PERMUTATIONS_EXAMPLE = 10000
-    N_PERMUTATIONS_COMPARISON = (
-        50000  # Fewer for the comparison example for speed
-    )
+    N_PERMUTATIONS_EXAMPLE = 1000
+    N_PERMUTATIONS_COMPARISON = 1000
+    RANDOM_SEED = None
+
+    np.random.seed(RANDOM_SEED)
+    import random
+
+    random.seed(RANDOM_SEED)
+    import os
+
+    if RANDOM_SEED is not None:
+        os.environ["PYTHONHASHSEED"] = str(RANDOM_SEED)
 
     print(f"--- Running examples with n_jobs = {N_JOBS_TO_USE} ---")
 
@@ -2738,15 +2770,15 @@ def example_usage():
 
     # Using the Pipeline API with pre-defined numeric ranks
     print("\nUsing Pipeline API with numeric ranks:")
-    n_items_in_example = (
-        8  # This can often be inferred, but good to be explicit
-    )
+    n_items_in_example = 8
     results_numeric = (
         RankPipeline()
         .with_ranked_data(ranks_numeric)
-        .compute_sra(epsilon=0.0, metric="sd", B=1)
+        .compute_sra(epsilon=0.0, metric="sd", B=1, imputation_seed=RANDOM_SEED)
         .random_list_sra(
-            n_permutations=N_PERMUTATIONS_EXAMPLE, n_jobs=N_JOBS_TO_USE
+            n_permutations=N_PERMUTATIONS_EXAMPLE,
+            n_jobs=N_JOBS_TO_USE,
+            seed=RANDOM_SEED,
         )  # Use n_jobs
         .test_significance(
             style="max", window=1, use_gpd=False, n_jobs=N_JOBS_TO_USE
@@ -2777,7 +2809,8 @@ def example_usage():
             metric=sra_config.metric,
             B=sra_config.B,
             n_permutations=N_PERMUTATIONS_EXAMPLE,
-            n_jobs=N_JOBS_TO_USE,  # Use n_jobs
+            n_jobs=N_JOBS_TO_USE,
+            seed=RANDOM_SEED,
         ).generate(ranks_numeric, nitems=n_items_in_example)
         null_result = null_estimator.get_result()
 
@@ -2847,9 +2880,11 @@ def example_usage():
     results_items = (
         RankPipeline()
         .with_items_lists(gene_lists)
-        .compute_sra(epsilon=0.0, metric="sd", B=1)
+        .compute_sra(epsilon=0.0, metric="sd", B=1, imputation_seed=RANDOM_SEED)
         .random_list_sra(
-            n_permutations=N_PERMUTATIONS_EXAMPLE, n_jobs=N_JOBS_TO_USE
+            n_permutations=N_PERMUTATIONS_EXAMPLE,
+            n_jobs=N_JOBS_TO_USE,
+            seed=RANDOM_SEED,
         )  # Use n_jobs
         .test_significance(
             style="max", window=1, use_gpd=False, n_jobs=N_JOBS_TO_USE
@@ -2910,21 +2945,6 @@ def example_usage():
             "Note: Full SRA computation with very large nitems can be slow/memory intensive "
             "even with parallelization for permutations. This example only checks data prep."
         )
-        # If you want to run the full SRA with parallelization:
-        # print("Attempting full SRA for large sparse IDs with parallelization...")
-        # results_large_full = (
-        #     RankPipeline()
-        #     .with_ranked_data(ranks_large_ids)
-        #     .compute_sra(B=1)
-        #     .random_list_sra(n_permutations=100, n_jobs=N_JOBS_TO_USE) # Reduced perms for example
-        #     .test_significance(n_jobs=N_JOBS_TO_USE)
-        #     .build()
-        # )
-        # if "error" not in results_large_full:
-        #    print(f"SRA Values (first 5): {results_large_full.get('sra_values', [])[:5]}")
-        #    print(f"P-value: {results_large_full.get('p_value', 'N/A')}")
-        # else:
-        #    print(f"Full SRA for large IDs failed: {results_large_full['error']}")
     else:
         print("Pipeline build step failed for large IDs.")
 
@@ -2946,14 +2966,18 @@ def example_usage():
         # Use n_jobs in RandomListSRA constructor
         null1 = (
             RandomListSRA(
-                n_permutations=N_PERMUTATIONS_COMPARISON, n_jobs=N_JOBS_TO_USE
+                n_permutations=N_PERMUTATIONS_COMPARISON,
+                n_jobs=N_JOBS_TO_USE,
+                seed=RANDOM_SEED,
             )
             .generate(method1_ranks, nitems=n1)
             .get_result()
         )
         null2 = (
             RandomListSRA(
-                n_permutations=N_PERMUTATIONS_COMPARISON, n_jobs=N_JOBS_TO_USE
+                n_permutations=N_PERMUTATIONS_COMPARISON,
+                n_jobs=N_JOBS_TO_USE,
+                seed=RANDOM_SEED,
             )
             .generate(method2_ranks, nitems=n2)
             .get_result()
